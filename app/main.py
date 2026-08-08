@@ -31,12 +31,26 @@ async def lifespan(app: FastAPI):
     milvus_manager.connect()
     logger.info("✅ Milvus 连接成功")
     
+    # MemoryService Redis 连接状态（实际初始化在 RagAgentService._initialize_agent 中）
+    from app.services.memory_service import get_memory_service
+    mem_service = get_memory_service()
+    if mem_service and mem_service._redis_available:
+        logger.info("✅ Redis 摘要层已就绪")
+    else:
+        logger.warning("⚠️ Redis 摘要层未就绪（降级为纯 SQLite 模式）")
+
     logger.info("=" * 60)
-    
+
     yield
-    
+
     # 关闭时执行
-    logger.info("🔌 正在关闭 Milvus 连接...")
+    logger.info("🔌 正在关闭服务...")
+
+    # 清理 RAG Agent 资源（SQLite + Redis）
+    from app.services.rag_agent_service import rag_agent_service
+    await rag_agent_service.cleanup()
+
+    # 关闭 Milvus
     milvus_manager.close()
     logger.info(f"👋 {config.app_name} 关闭")
 
