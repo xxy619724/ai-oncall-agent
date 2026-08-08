@@ -97,8 +97,12 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"保存摘要到 Redis 失败: {e}")
 
-    def _get_messages(self, session_id: str) -> list[BaseMessage]:
-        """从 checkpointer 获取会话消息列表
+    async def _aget_messages(self, session_id: str) -> list[BaseMessage]:
+        """从 checkpointer 异步获取会话消息列表
+
+        使用 AsyncSqliteSaver 的 aget_tuple 异步接口。注意：不能在事件循环
+        线程中同步调用 AsyncSqliteSaver.get()，否则会死锁（其内部 async 操作
+        需要事件循环，而事件循环正被当前同步调用阻塞）。
 
         Args:
             session_id: 会话 ID（即 thread_id）
@@ -108,18 +112,16 @@ class MemoryService:
         """
         try:
             config_dict = {"configurable": {"thread_id": session_id}}
-            checkpoint_tuple = self.checkpointer.get(config_dict)
+            checkpoint_tuple = await self.checkpointer.aget_tuple(config_dict)
 
             if not checkpoint_tuple:
                 return []
 
-            # 安全提取 checkpoint 数据
-            if hasattr(checkpoint_tuple, "checkpoint"):
-                checkpoint_data = checkpoint_tuple.checkpoint
-            else:
-                checkpoint_data = (
-                    checkpoint_tuple[0] if checkpoint_tuple else {}
-                )
+            checkpoint_data = (
+                checkpoint_tuple.checkpoint
+                if hasattr(checkpoint_tuple, "checkpoint")
+                else {}
+            )
 
             if not isinstance(checkpoint_data, dict):
                 return []
@@ -160,7 +162,7 @@ class MemoryService:
 
         return None
 
-    def get_context(self, session_id: str) -> list[BaseMessage]:
+    async def aget_context(self, session_id: str) -> list[BaseMessage]:
         """获取会话上下文：Redis 摘要 + SQLite 近期消息
 
         读取流程：
@@ -178,14 +180,14 @@ class MemoryService:
         summary = self._get_summary(session_id)
 
         # 2. 查 SQLite 消息
-        messages = self._get_messages(session_id)
+        messages = await self._aget_messages(session_id)
 
         # 3. 拼装
         if summary:
             return [SystemMessage(content=summary)] + messages
         return messages
 
-    def sync_summary(self, session_id: str) -> None:
+    async def sync_summary(self, session_id: str) -> None:
         """ainvoke 完成后调用：从 SQLite 提取摘要写入 Redis
 
         从 checkpointer 读取最新消息列表，检测 SummarizationMiddleware
@@ -194,7 +196,7 @@ class MemoryService:
         Args:
             session_id: 会话 ID
         """
-        messages = self._get_messages(session_id)
+        messages = await self._aget_messages(session_id)
         if not messages:
             return
 
@@ -202,7 +204,7 @@ class MemoryService:
         if summary:
             self._save_summary(session_id, summary)
 
-    def get_history(self, session_id: str) -> list[dict[str, Any]]:
+    async def aget_history(self, session_id: str) -> list[dict[str, Any]]:
         """获取会话历史（前端展示用）
 
         从 checkpointer 读取消息，转换为前端格式。
@@ -213,7 +215,7 @@ class MemoryService:
         Returns:
             消息历史列表 [{"role": "user|assistant", "content": "...", "timestamp": "..."}]
         """
-        messages = self._get_messages(session_id)
+        messages = await self._aget_messages(session_id)
         history: list[dict[str, Any]] = []
 
         from datetime import datetime
@@ -237,7 +239,7 @@ class MemoryService:
         logger.info(f"获取会话历史: {session_id}, 消息数量: {len(history)}")
         return history
 
-    def clear(self, session_id: str) -> bool:
+    async def aclear(self, session_id: str) -> bool:
         """清空双层存储：删 Redis 摘要 + 删 SQLite 线程
 
         Args:
@@ -258,17 +260,9 @@ class MemoryService:
                 logger.warning(f"删除 Redis 摘要失败: {e}")
                 success = False
 
-        # 2. 删 SQLite 线程
+        # 2. 删 SQLite 线程（异步）
         try:
-            # 尝试用 checkpointer 的 delete_thread 方法（MemorySaver 支持）
-            if hasattr(self.checkpointer, "delete_thread"):
-                self.checkpointer.delete_thread(session_id)
-            else:
-                # SqliteSaver 可能没有 delete_thread，用 SQL 删除
-                logger.warning(
-                    f"checkpointer 不支持 delete_thread，"
-                    f"SQLite 线程数据需手动清理: {session_id}"
-                )
+            await self.checkpointer.adelete_thread(session_id)
             logger.info(f"已清除会话历史: {session_id}")
         except Exception as e:
             logger.error(f"清空会话历史失败: {session_id}, 错误: {e}")

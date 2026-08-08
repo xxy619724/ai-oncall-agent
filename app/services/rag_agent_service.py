@@ -15,8 +15,8 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.sqlite import SqliteSaver
-import sqlite3
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+import aiosqlite
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from loguru import logger
 from typing_extensions import TypedDict
@@ -100,6 +100,7 @@ class RagAgentService:
             api_key=config.dashscope_api_key,
             temperature=0.7,
             streaming=streaming,
+            profile={"max_input_tokens": config.rag_context_window_size},
         )
 
         # 定义基础工具（与 AIOps Planner/Executor 使用同一套默认本地工具）
@@ -108,18 +109,9 @@ class RagAgentService:
         # MCP 客户端（延迟初始化，使用全局管理）
         self.mcp_tools: list = []
 
-        # 创建持久化检查点：优先 SqliteSaver，失败降级为 MemorySaver
-        try:
-            self._sqlite_conn = sqlite3.connect(
-                config.sqlite_db_path, check_same_thread=False
-            )
-            self.checkpointer = SqliteSaver(self._sqlite_conn)
-            self.checkpointer.setup()
-            logger.info(f"SqliteSaver 初始化成功: {config.sqlite_db_path}")
-        except Exception as e:
-            logger.error(f"SqliteSaver 初始化失败，降级为 MemorySaver: {e}")
-            self._sqlite_conn = None
-            self.checkpointer = MemorySaver()
+        # 临时使用 MemorySaver，在 _initialize_agent 中替换为 AsyncSqliteSaver
+        self.checkpointer = MemorySaver()
+        self._sqlite_conn = None
 
         # Agent 初始化（会在异步方法中完成）
         self.agent = None
@@ -152,6 +144,17 @@ class RagAgentService:
             logger.info(f"成功加载 {len(mcp_tools)} 个 MCP 工具")
 
         all_tools = self.tools + self.mcp_tools
+
+        # 初始化 AsyncSqliteSaver（异步持久化检查点），失败降级为 MemorySaver
+        try:
+            self._sqlite_conn = await aiosqlite.connect(config.sqlite_db_path)
+            self.checkpointer = AsyncSqliteSaver(self._sqlite_conn)
+            await self.checkpointer.setup()
+            logger.info(f"AsyncSqliteSaver 初始化成功: {config.sqlite_db_path}")
+        except Exception as e:
+            logger.error(f"AsyncSqliteSaver 初始化失败，降级为 MemorySaver: {e}")
+            self._sqlite_conn = None
+            self.checkpointer = MemorySaver()
 
         # 上下文自动压缩中间件：两层记忆架构
         # 第一层（滑动窗口）：保留最近 N 轮完整对话 → keep
@@ -268,7 +271,7 @@ class RagAgentService:
                 from app.services.memory_service import get_memory_service
                 mem_service = get_memory_service()
                 if mem_service:
-                    mem_service.sync_summary(session_id)
+                    await mem_service.sync_summary(session_id)
 
                 return answer
 
@@ -345,7 +348,7 @@ class RagAgentService:
             from app.services.memory_service import get_memory_service
             mem_service = get_memory_service()
             if mem_service:
-                mem_service.sync_summary(session_id)
+                await mem_service.sync_summary(session_id)
 
             yield {"type": "complete"}
 
@@ -356,7 +359,7 @@ class RagAgentService:
             )
             yield {"type": "error", "data": detail}
 
-    def get_session_history(self, session_id: str) -> list:
+    async def aget_session_history(self, session_id: str) -> list:
         """获取会话历史（委托给 MemoryService）
 
         Args:
@@ -365,24 +368,28 @@ class RagAgentService:
         Returns:
             list: 消息历史列表 [{"role": "user|assistant", "content": "...", "timestamp": "..."}]
         """
+        # 确保 checkpointer 已初始化为 AsyncSqliteSaver，MemoryService 已就绪
+        await self._initialize_agent()
+
         from app.services.memory_service import get_memory_service
 
         mem_service = get_memory_service()
         if mem_service:
-            return mem_service.get_history(session_id)
+            return await mem_service.aget_history(session_id)
 
-        # 降级：直接从 checkpointer 读取
+        # 降级：直接从 checkpointer 异步读取
         try:
             config_dict = {"configurable": {"thread_id": session_id}}
-            checkpoint_tuple = self.checkpointer.get(config_dict)
+            checkpoint_tuple = await self.checkpointer.aget_tuple(config_dict)
 
             if not checkpoint_tuple:
                 return []
 
-            if hasattr(checkpoint_tuple, 'checkpoint'):
-                checkpoint_data = checkpoint_tuple.checkpoint
-            else:
-                checkpoint_data = checkpoint_tuple[0] if checkpoint_tuple else {}
+            checkpoint_data = (
+                checkpoint_tuple.checkpoint
+                if hasattr(checkpoint_tuple, 'checkpoint')
+                else {}
+            )
 
             messages = checkpoint_data.get("channel_values", {}).get("messages", [])
 
@@ -404,7 +411,7 @@ class RagAgentService:
             logger.error(f"获取会话历史失败: {session_id}, 错误: {e}")
             return []
 
-    def clear_session(self, session_id: str) -> bool:
+    async def aclear_session(self, session_id: str) -> bool:
         """清空会话历史（委托给 MemoryService）
 
         Args:
@@ -413,16 +420,18 @@ class RagAgentService:
         Returns:
             bool: 是否成功
         """
+        # 确保 checkpointer 已初始化为 AsyncSqliteSaver，MemoryService 已就绪
+        await self._initialize_agent()
+
         from app.services.memory_service import get_memory_service
 
         mem_service = get_memory_service()
         if mem_service:
-            return mem_service.clear(session_id)
+            return await mem_service.aclear(session_id)
 
-        # 降级：直接从 checkpointer 删除
+        # 降级：直接从 checkpointer 异步删除
         try:
-            if hasattr(self.checkpointer, "delete_thread"):
-                self.checkpointer.delete_thread(session_id)
+            await self.checkpointer.adelete_thread(session_id)
             logger.info(f"已清除会话历史(降级): {session_id}")
             return True
         except Exception as e:
@@ -442,7 +451,7 @@ class RagAgentService:
 
             # 关闭 SQLite 连接
             if hasattr(self, "_sqlite_conn") and self._sqlite_conn:
-                self._sqlite_conn.close()
+                await self._sqlite_conn.close()
                 logger.info("SQLite 连接已关闭")
 
             logger.info("RAG Agent 服务资源已清理")
