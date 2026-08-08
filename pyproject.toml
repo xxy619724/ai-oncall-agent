@@ -32,6 +32,8 @@ dependencies = [
     "langchain-qwq>=0.3.4",
     "pypdf>=5.0.0",
     "python-docx>=1.1.0",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "redis>=7.1.1",
 ]
 
 [project.optional-dependencies]
