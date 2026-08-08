@@ -263,6 +263,13 @@ class RagAgentService:
                     logger.info(f"[会话 {session_id}] Agent 调用了工具: {tool_names}")
 
                 logger.info(f"[会话 {session_id}] RAG Agent 查询完成（非流式）")
+
+                # 同步摘要到 Redis
+                from app.services.memory_service import get_memory_service
+                mem_service = get_memory_service()
+                if mem_service:
+                    mem_service.sync_summary(session_id)
+
                 return answer
 
             logger.warning(f"[会话 {session_id}] Agent 返回结果为空")
@@ -333,6 +340,13 @@ class RagAgentService:
                                     }
 
             logger.info(f"[会话 {session_id}] RAG Agent 查询完成（流式）")
+
+            # 同步摘要到 Redis
+            from app.services.memory_service import get_memory_service
+            mem_service = get_memory_service()
+            if mem_service:
+                mem_service.sync_summary(session_id)
+
             yield {"type": "complete"}
 
         except Exception as e:
@@ -343,8 +357,7 @@ class RagAgentService:
             yield {"type": "error", "data": detail}
 
     def get_session_history(self, session_id: str) -> list:
-        """
-        获取会话历史（从 MemorySaver checkpointer 中读取）
+        """获取会话历史（委托给 MemoryService）
 
         Args:
             session_id: 会话ID（即 thread_id）
@@ -352,64 +365,47 @@ class RagAgentService:
         Returns:
             list: 消息历史列表 [{"role": "user|assistant", "content": "...", "timestamp": "..."}]
         """
+        from app.services.memory_service import get_memory_service
+
+        mem_service = get_memory_service()
+        if mem_service:
+            return mem_service.get_history(session_id)
+
+        # 降级：直接从 checkpointer 读取
         try:
-            # 使用 checkpointer 的 get 方法获取最新的检查点
-            config = {"configurable": {"thread_id": session_id}}
-            
-            # 获取该 thread 的最新检查点
-            checkpoint_tuple = self.checkpointer.get(config)
-            
+            config_dict = {"configurable": {"thread_id": session_id}}
+            checkpoint_tuple = self.checkpointer.get(config_dict)
+
             if not checkpoint_tuple:
-                logger.info(f"获取会话历史: {session_id}, 消息数量: 0")
                 return []
-            
-            # checkpoint_tuple 可能是命名元组或普通元组，安全地提取 checkpoint
-            # 通常第一个元素是 checkpoint 数据
+
             if hasattr(checkpoint_tuple, 'checkpoint'):
-                checkpoint_data = checkpoint_tuple.checkpoint  # type: ignore
+                checkpoint_data = checkpoint_tuple.checkpoint
             else:
-                # 如果是普通元组，第一个元素是 checkpoint
                 checkpoint_data = checkpoint_tuple[0] if checkpoint_tuple else {}
-            
-            # 从检查点中提取消息
+
             messages = checkpoint_data.get("channel_values", {}).get("messages", [])
-            
-            # 转换为前端需要的格式
+
             history = []
             for msg in messages:
-                # 跳过系统消息
                 if isinstance(msg, SystemMessage):
                     continue
-                    
                 role = "user" if isinstance(msg, HumanMessage) else "assistant"
                 content = msg.content if hasattr(msg, 'content') else str(msg)
-                
-                # 提取时间戳（如果有的话）
                 timestamp = getattr(msg, 'timestamp', None)
-                if timestamp:
-                    history.append({
-                        "role": role,
-                        "content": content,
-                        "timestamp": timestamp
-                    })
-                else:
+                if not timestamp:
                     from datetime import datetime
-                    history.append({
-                        "role": role,
-                        "content": content,
-                        "timestamp": datetime.now().isoformat()
-                    })
-            
-            logger.info(f"获取会话历史: {session_id}, 消息数量: {len(history)}")
+                    timestamp = datetime.now().isoformat()
+                history.append({"role": role, "content": content, "timestamp": timestamp})
+
+            logger.info(f"获取会话历史(降级): {session_id}, 消息数量: {len(history)}")
             return history
-            
         except Exception as e:
             logger.error(f"获取会话历史失败: {session_id}, 错误: {e}")
             return []
 
     def clear_session(self, session_id: str) -> bool:
-        """
-        清空会话历史（从 MemorySaver checkpointer 中删除）
+        """清空会话历史（委托给 MemoryService）
 
         Args:
             session_id: 会话ID（即 thread_id）
@@ -417,13 +413,18 @@ class RagAgentService:
         Returns:
             bool: 是否成功
         """
+        from app.services.memory_service import get_memory_service
+
+        mem_service = get_memory_service()
+        if mem_service:
+            return mem_service.clear(session_id)
+
+        # 降级：直接从 checkpointer 删除
         try:
-            # 使用 checkpointer 的 delete_thread 方法删除该 thread 的所有检查点
-            self.checkpointer.delete_thread(session_id)
-            
-            logger.info(f"已清除会话历史: {session_id}")
+            if hasattr(self.checkpointer, "delete_thread"):
+                self.checkpointer.delete_thread(session_id)
+            logger.info(f"已清除会话历史(降级): {session_id}")
             return True
-            
         except Exception as e:
             logger.error(f"清空会话历史失败: {session_id}, 错误: {e}")
             return False
@@ -432,7 +433,18 @@ class RagAgentService:
         """清理资源"""
         try:
             logger.info("清理 RAG Agent 服务资源...")
-            # MCP 客户端由全局管理器统一管理，无需手动清理
+
+            # 关闭 MemoryService Redis 连接
+            from app.services.memory_service import get_memory_service
+            mem_service = get_memory_service()
+            if mem_service:
+                mem_service.close_redis()
+
+            # 关闭 SQLite 连接
+            if hasattr(self, "_sqlite_conn") and self._sqlite_conn:
+                self._sqlite_conn.close()
+                logger.info("SQLite 连接已关闭")
+
             logger.info("RAG Agent 服务资源已清理")
         except Exception as e:
             logger.error(f"清理资源失败: {e}")
