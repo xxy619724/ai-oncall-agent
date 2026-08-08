@@ -15,6 +15,8 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from loguru import logger
 from typing_extensions import TypedDict
@@ -106,8 +108,18 @@ class RagAgentService:
         # MCP 客户端（延迟初始化，使用全局管理）
         self.mcp_tools: list = []
 
-        # 创建内存检查点（用于会话管理）
-        self.checkpointer = MemorySaver()
+        # 创建持久化检查点：优先 SqliteSaver，失败降级为 MemorySaver
+        try:
+            self._sqlite_conn = sqlite3.connect(
+                config.sqlite_db_path, check_same_thread=False
+            )
+            self.checkpointer = SqliteSaver(self._sqlite_conn)
+            self.checkpointer.setup()
+            logger.info(f"SqliteSaver 初始化成功: {config.sqlite_db_path}")
+        except Exception as e:
+            logger.error(f"SqliteSaver 初始化失败，降级为 MemorySaver: {e}")
+            self._sqlite_conn = None
+            self.checkpointer = MemorySaver()
 
         # Agent 初始化（会在异步方法中完成）
         self.agent = None
@@ -162,6 +174,10 @@ class RagAgentService:
         )
 
         self._agent_initialized = True
+
+        # 初始化 MemoryService（双层记忆服务）
+        from app.services.memory_service import init_memory_service
+        init_memory_service(self.checkpointer)
 
         if all_tools:
             tool_names = [tool.name if hasattr(tool, "name") else str(tool) for tool in all_tools]
