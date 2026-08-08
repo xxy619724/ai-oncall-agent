@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     prometheus_base_url: str = "http://127.0.0.1:9090"
     prometheus_request_timeout: float = 10.0
 
+    # 对话记忆持久化配置
+    sqlite_db_path: str = "./data/chat.db"
+    redis_url: str = "redis://localhost:6379/0"
+    redis_summary_ttl: int = 604800  # 7天（秒）
+
     @property
     def mcp_servers(self) -> Dict[str, Dict[str, Any]]:
         """获取完整的 MCP 服务器配置"""
