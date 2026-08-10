@@ -61,6 +61,7 @@ class RagAgentService:
         # 临时使用 MemorySaver，在 _initialize_agent 中替换为 AsyncSqliteSaver
         self.checkpointer = MemorySaver()
         self._sqlite_conn = None
+        self._cleaner = None  # SQLite Checkpoint 清理器
 
         # Agent 初始化（会在异步方法中完成）
         self.agent = None
@@ -100,9 +101,15 @@ class RagAgentService:
             self.checkpointer = AsyncSqliteSaver(self._sqlite_conn)
             await self.checkpointer.setup()
             logger.info(f"AsyncSqliteSaver 初始化成功: {config.sqlite_db_path}")
+
+            # 初始化 Checkpoint 清理器并启动定时任务
+            from app.services.checkpoint_cleaner import SqliteCheckpointCleaner
+            self._cleaner = SqliteCheckpointCleaner(self._sqlite_conn)
+            await self._cleaner.start_periodic_cleanup()
         except Exception as e:
             logger.error(f"AsyncSqliteSaver 初始化失败，降级为 MemorySaver: {e}")
             self._sqlite_conn = None
+            self._cleaner = None
             self.checkpointer = MemorySaver()
 
         # 上下文自动压缩中间件：两层记忆架构
@@ -222,6 +229,12 @@ class RagAgentService:
                 if mem_service:
                     await mem_service.sync_summary(session_id)
 
+                # 更新会话活跃时间（供清理服务判断过期）
+                if self._cleaner:
+                    await self._cleaner.touch_session(
+                        session_id, message_count=len(messages_result)
+                    )
+
                 return answer
 
             logger.warning(f"[会话 {session_id}] Agent 返回结果为空")
@@ -298,6 +311,10 @@ class RagAgentService:
             mem_service = get_memory_service()
             if mem_service:
                 await mem_service.sync_summary(session_id)
+
+            # 更新会话活跃时间（供清理服务判断过期）
+            if self._cleaner:
+                await self._cleaner.touch_session(session_id)
 
             yield {"type": "complete"}
 
@@ -391,6 +408,10 @@ class RagAgentService:
         """清理资源"""
         try:
             logger.info("清理 RAG Agent 服务资源...")
+
+            # 停止 Checkpoint 清理器
+            if self._cleaner:
+                await self._cleaner.stop()
 
             # 关闭 MemoryService Redis 连接
             from app.services.memory_service import get_memory_service

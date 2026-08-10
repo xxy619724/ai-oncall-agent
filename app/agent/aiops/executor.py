@@ -32,6 +32,8 @@ async def executor(state: PlanExecuteState) -> Dict[str, Any]:
 
     # 取出第一个步骤
     task = plan[0]
+    # 目标锚定：取原始任务目标，确保执行单步时始终知道整体目标，避免目标漂移
+    input_text = state.get("input", "")
     logger.info(f"当前任务: {task}")
 
     try:
@@ -62,9 +64,11 @@ async def executor(state: PlanExecuteState) -> Dict[str, Any]:
         # 创建工具节点（自动执行工具调用）
         tool_node = ToolNode(all_tools)
 
-        # 构建消息（只包含当前步骤，避免原始任务干扰）
+        # 构建消息（含目标锚定区：注入原始任务目标，避免执行单步时目标漂移）
         messages = [
-            SystemMessage(content="""你是一个能力强大的助手，负责执行具体的任务步骤。
+            SystemMessage(content=f"""你是一个能力强大的助手，负责执行具体的任务步骤。
+
+【目标锚定】原始任务目标: {input_text}
 
 你可以使用各种工具来完成任务。对于每个步骤：
 1. 理解步骤的目标

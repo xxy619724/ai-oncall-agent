@@ -69,6 +69,16 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     redis_summary_ttl: int = 604800  # 7天（秒）
 
+    # SQLite Checkpoint 自动清理配置
+    sqlite_checkpoint_max_age_days: int = 7      # checkpoint 保留天数（超过则清理全量对话）
+    sqlite_cleanup_interval_hours: int = 24      # 定时清理间隔（小时）
+    sqlite_cleanup_batch_size: int = 100          # 每批清理会话数（避免锁库）
+
+    # 记忆写入门控配置
+    memory_dedup_threshold: float = 0.95     # 查重阈值（相似度≥此值判定重复，跳过写入）
+    memory_conflict_threshold: float = 0.80  # 冲突检测阈值（相似度≥此值进入冲突检测）
+    memory_default_ttl_days: int = 90        # 经验默认 TTL（天，超时后可软删除）
+
     @property
     def mcp_servers(self) -> Dict[str, Dict[str, Any]]:
         """获取完整的 MCP 服务器配置"""
