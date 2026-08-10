@@ -171,35 +171,38 @@ class AIOpsService:
                 }
             }
 
-            async for event in self.graph.astream(
-                input=initial_state,
-                config=config_dict,
-                stream_mode="updates"
-            ):
-                # 解析事件
-                for node_name, node_output in event.items():
-                    logger.info(f"节点 '{node_name}' 输出事件")
+            # ===== 使用 start_trace 包裹整个执行过程 =====
+            with start_trace(session_id=session_id, input_text=user_input) as trace_ctx:
+                async for event in self.graph.astream(
+                    input=initial_state,
+                    config=config_dict,
+                    stream_mode="updates"
+                ):
+                    # 解析事件
+                    for node_name, node_output in event.items():
+                        logger.info(f"节点 '{node_name}' 输出事件")
 
-                    # 根据节点类型生成不同的事件
-                    if node_name == NODE_PLANNER:
-                        yield self._format_planner_event(node_output)
+                        # 根据节点类型生成不同的事件
+                        if node_name == NODE_PLANNER:
+                            yield self._format_planner_event(node_output)
 
-                    elif node_name == NODE_EXECUTOR:
-                        yield self._format_executor_event(node_output)
+                        elif node_name == NODE_EXECUTOR:
+                            yield self._format_executor_event(node_output)
 
-                    elif node_name == NODE_REPLANNER:
-                        yield self._format_replanner_event(node_output)
+                        elif node_name == NODE_REPLANNER:
+                            yield self._format_replanner_event(node_output)
 
-                    elif node_name == NODE_MEMORY_WRITER:
-                        yield self._format_memory_writer_event(node_output)
+                        elif node_name == NODE_MEMORY_WRITER:
+                            yield self._format_memory_writer_event(node_output)
 
-            # 获取最终状态
-            final_state = self.graph.get_state(config_dict)
-            final_response = ""
+                # 获取最终状态（使用 async 接口避免 AsyncSqliteSaver 同步调用错误）
+                final_state = await self.graph.aget_state(config_dict)
+                final_response = ""
 
-            # 安全地获取响应（处理 values 可能为 None 的情况）
-            if final_state and final_state.values:
-                final_response = final_state.values.get("response", "")
+                # 安全地获取响应（处理 values 可能为 None 的情况）
+                if final_state and final_state.values:
+                    final_response = final_state.values.get("response", "")
+            # ===== trace 在 with 退出时自动结束 =====
 
             # 发送完成事件
             yield {
