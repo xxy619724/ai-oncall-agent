@@ -9,6 +9,7 @@ from loguru import logger
 
 from app.models.aiops import AIOpsRequest
 from app.services.aiops_service import aiops_service
+from app.observability import observability_store, metrics_collector
 
 router = APIRouter()
 
@@ -151,3 +152,46 @@ async def diagnose_stream(request: AIOpsRequest):
             }
 
     return EventSourceResponse(event_generator())
+
+
+@router.get("/aiops/metrics")
+async def get_metrics():
+    """获取可观测聚合指标
+
+    返回工具调用统计（成功率/延迟/Token）+ 节点执行统计 + 最近 trace 列表。
+    用于运维仪表盘和面试演示。
+    """
+    try:
+        summary = await metrics_collector.get_summary()
+        return {"status": "success", "data": summary}
+    except Exception as e:
+        logger.error(f"获取指标失败: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/aiops/traces/{trace_id}")
+async def get_trace(trace_id: str):
+    """查询单条 trace 的完整链路（含 spans + tool_metrics）
+
+    用于全链路复现：输入什么 → planner 生成什么计划 → executor 调了哪些工具 →
+    replanner 做了什么决策 → memory_writer 写了什么 → 最终响应。
+    """
+    try:
+        trace = await observability_store.get_trace(trace_id)
+        if trace is None:
+            return {"status": "not_found", "message": f"trace_id {trace_id} 不存在"}
+        return {"status": "success", "data": trace}
+    except Exception as e:
+        logger.error(f"查询 trace 失败: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/aiops/traces")
+async def list_traces(limit: int = 20):
+    """列出最近的 trace（不含 spans 明细）"""
+    try:
+        traces = await observability_store.list_traces(limit=limit)
+        return {"status": "success", "data": traces, "count": len(traces)}
+    except Exception as e:
+        logger.error(f"列出 trace 失败: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
