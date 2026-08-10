@@ -20,7 +20,7 @@ from loguru import logger
 from app.config import config
 from app.observability.metrics import metrics_collector
 from app.observability.store import observability_store
-from app.observability.trace import Span, current_trace, _state_to_summary, _truncate
+from app.observability.trace import current_trace, _state_to_summary
 
 
 def _extract_token_usage(result: Any) -> int:
