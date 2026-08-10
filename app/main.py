@@ -39,6 +39,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("⚠️ Redis 摘要层未就绪（降级为纯 SQLite 模式）")
 
+    # 初始化可观测数据存储（Trace/Span/Metric）
+    logger.info("📊 正在初始化可观测数据存储...")
+    await observability_store.initialize()
+    if observability_store.available:
+        logger.info("✅ 可观测数据存储已就绪（Trace/Span/Metric）")
+    else:
+        logger.warning("⚠️ 可观测数据存储未就绪（埋点将降级为零开销直通）")
+
     logger.info("=" * 60)
 
     yield

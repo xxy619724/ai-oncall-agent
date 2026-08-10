@@ -12,6 +12,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from loguru import logger
 
 from app.config import config
+from app.observability import start_trace, observability_store
 from app.agent.aiops import (
     PlanExecuteState,
     planner,
