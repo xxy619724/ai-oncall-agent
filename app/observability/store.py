@@ -9,7 +9,6 @@
 连接由 main.py lifespan 初始化，全局单例 observability_store。
 """
 
-import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
