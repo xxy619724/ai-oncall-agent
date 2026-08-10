@@ -21,6 +21,7 @@ from loguru import logger
 
 from app.config import config
 from .state import PlanExecuteState
+from app.observability import trace_node
 
 
 # 错误识别关键词（用于从 past_steps 中提取失败步骤）
@@ -370,6 +371,7 @@ def make_memory_writer(sqlite_conn: aiosqlite.Connection | None):
         LangGraph 节点函数
     """
 
+    @trace_node("memory_writer")
     async def memory_writer(state: PlanExecuteState) -> Dict[str, Any]:
         """经验回写节点：把任务经验写入 LTM
 

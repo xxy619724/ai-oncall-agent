@@ -15,6 +15,7 @@ from app.tools import DEFAULT_LOCAL_AGENT_TOOLS, retrieve_knowledge
 from app.agent.mcp_client import get_mcp_client_with_retry
 from .state import PlanExecuteState
 from .utils import format_tools_description
+from app.observability import trace_node
 
 
 class Plan(BaseModel):
@@ -60,6 +61,7 @@ planner_prompt = ChatPromptTemplate.from_messages(
 )
 
 
+@trace_node("planner")
 async def planner(state: PlanExecuteState) -> Dict[str, Any]:
     """
     规划节点：根据用户输入生成执行计划

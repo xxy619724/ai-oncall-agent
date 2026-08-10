@@ -13,8 +13,10 @@ from app.config import config
 from app.tools import DEFAULT_LOCAL_AGENT_TOOLS
 from app.agent.mcp_client import get_mcp_client_with_retry
 from .state import PlanExecuteState
+from app.observability import trace_node
 
 
+@trace_node("executor")
 async def executor(state: PlanExecuteState) -> Dict[str, Any]:
     """
     执行节点：执行计划中的下一个步骤

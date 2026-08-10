@@ -6,4 +6,24 @@
 - 零开销降级：observability_enabled=False 或无 trace 上下文时，埋点自动跳过
 """
 
-# 注意：完整导出在 Task 4 中添加（等 trace.py/metrics.py/instrumentation.py 全部创建后）
+from app.observability.store import observability_store, ObservabilityStore
+from app.observability.trace import (
+    TraceContext,
+    Span,
+    current_trace,
+    start_trace,
+)
+from app.observability.metrics import metrics_collector, MetricsCollector
+from app.observability.instrumentation import trace_node
+
+__all__ = [
+    "observability_store",
+    "ObservabilityStore",
+    "TraceContext",
+    "Span",
+    "current_trace",
+    "start_trace",
+    "metrics_collector",
+    "MetricsCollector",
+    "trace_node",
+]

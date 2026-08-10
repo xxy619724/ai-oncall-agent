@@ -15,6 +15,7 @@ from app.tools import DEFAULT_LOCAL_AGENT_TOOLS
 from app.agent.mcp_client import get_mcp_client_with_retry
 from .state import PlanExecuteState
 from .utils import format_tools_description
+from app.observability import trace_node
 
 
 class Response(BaseModel):
@@ -108,6 +109,7 @@ response_prompt = ChatPromptTemplate.from_messages(
 )
 
 
+@trace_node("replanner")
 async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
     """
     重新规划节点：决定是继续、调整计划还是生成最终响应
