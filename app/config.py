@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     memory_conflict_threshold: float = 0.80  # 冲突检测阈值（相似度≥此值进入冲突检测）
     memory_default_ttl_days: int = 90        # 经验默认 TTL（天，超时后可软删除）
 
+    # 可观测体系配置（Trace/Span/Metric）
+    observability_enabled: bool = True            # 总开关：False 时所有埋点零开销直通
+    observability_db_path: str = "./data/observability.db"  # 独立于 checkpoint 库
+    observability_span_input_max_len: int = 500   # Span 输入摘要截断长度（字符）
+    observability_span_output_max_len: int = 500  # Span 输出摘要截断长度（字符）
+    observability_trace_input_max_len: int = 500  # Trace 输入截断长度（字符）
+
     @property
     def mcp_servers(self) -> Dict[str, Dict[str, Any]]:
         """获取完整的 MCP 服务器配置"""
