@@ -93,9 +93,13 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
         # 获取本地工具
         local_tools = list(DEFAULT_LOCAL_AGENT_TOOLS)
 
-        # 获取 MCP 工具
-        mcp_client = await get_mcp_client_with_retry()
-        mcp_tools = await mcp_client.get_tools()
+        # 获取 MCP 工具（失败时降级为仅本地工具）
+        try:
+            mcp_client = await get_mcp_client_with_retry()
+            mcp_tools = await mcp_client.get_tools()
+        except Exception as e:
+            logger.warning(f"MCP 工具获取失败，仅使用本地工具: {e}")
+            mcp_tools = []
 
         # 合并所有工具
         all_tools = local_tools + mcp_tools
@@ -122,6 +126,7 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
         llm = ChatQwen(
             model=config.rag_model,
             api_key=config.dashscope_api_key,
+            base_url=config.dashscope_api_base,
             temperature=0
         )
 

@@ -4,30 +4,49 @@
 """
 
 from typing import AsyncGenerator, Dict, Any
+
+import aiosqlite
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from loguru import logger
 
-from app.agent.aiops import PlanExecuteState, planner, executor, replanner
+from app.config import config
+from app.agent.aiops import (
+    PlanExecuteState,
+    planner,
+    executor,
+    replanner,
+    make_memory_writer,
+    init_experiences_table,
+)
 
 
 # 节点名称常量
 NODE_PLANNER = "planner"
 NODE_EXECUTOR = "executor"
 NODE_REPLANNER = "replanner"
+NODE_MEMORY_WRITER = "memory_writer"  # 经验回写节点
 
 
 class AIOpsService:
     """通用 Plan-Execute-Replan 服务"""
 
     def __init__(self):
-        """初始化服务"""
+        """初始化服务（临时 MemorySaver，实际使用前需调用 _initialize_persistence）"""
         self.checkpointer = MemorySaver()
+        self._sqlite_conn: aiosqlite.Connection | None = None
+        self._persistence_initialized = False
         self.graph = self._build_graph()
-        logger.info("Plan-Execute-Replan Service 初始化完成")
+        logger.info("Plan-Execute-Replan Service 初始化完成（待异步持久化）")
 
     def _build_graph(self):
-        """构建 Plan-Execute-Replan 工作流"""
+        """构建 Plan-Execute-Replan 工作流（含经验回写节点）
+
+        流程：planner → executor → replanner → (有响应/兜底) → memory_writer → END
+                                                   ↓ (无响应有计划)
+                                                 executor
+        """
         logger.info("构建工作流图...")
 
         # 创建状态图
@@ -35,8 +54,12 @@ class AIOpsService:
 
         # 添加节点
         workflow.add_node(NODE_PLANNER, planner)      # 制定计划
-        workflow.add_node(NODE_EXECUTOR, executor)  # 执行步骤
+        workflow.add_node(NODE_EXECUTOR, executor)    # 执行步骤
         workflow.add_node(NODE_REPLANNER, replanner)  # 重新规划
+        # 经验回写节点（闭包绑定 SQLite 连接，None 时仅写 Milvus）
+        workflow.add_node(
+            NODE_MEMORY_WRITER, make_memory_writer(self._sqlite_conn)
+        )
 
         # 设置入口点
         workflow.set_entry_point(NODE_PLANNER)
@@ -45,38 +68,71 @@ class AIOpsService:
         workflow.add_edge(NODE_PLANNER, NODE_EXECUTOR)     # planner -> executor
         workflow.add_edge(NODE_EXECUTOR, NODE_REPLANNER)   # executor -> replanner
 
-        # replanner 的条件边
+        # replanner 的条件边：有响应 → 经验回写；无响应有计划 → 继续执行
         def should_continue(state: PlanExecuteState) -> str:
             """判断是否继续执行"""
-            # 如果已经生成了最终响应，结束
             if state.get("response"):
-                logger.info("已生成最终响应，结束流程")
-                return END
+                logger.info("已生成最终响应，进入经验回写")
+                return NODE_MEMORY_WRITER
 
-            # 如果还有计划步骤，继续执行
             plan = state.get("plan", [])
             if plan:
                 logger.info(f"继续执行，剩余 {len(plan)} 个步骤")
                 return NODE_EXECUTOR
 
-            # 计划为空但没有响应，返回 replanner 生成响应
-            logger.info("计划执行完毕，生成最终响应")
-            return END
+            # 兜底：计划为空且无响应，仍尝试回写（memory_writer 内部会跳过空响应）
+            logger.info("计划执行完毕，进入经验回写")
+            return NODE_MEMORY_WRITER
 
         workflow.add_conditional_edges(
             NODE_REPLANNER,
             should_continue,
             {
                 NODE_EXECUTOR: NODE_EXECUTOR,
-                END: END
-            }
+                NODE_MEMORY_WRITER: NODE_MEMORY_WRITER,
+            },
         )
+
+        # 经验回写完成后结束
+        workflow.add_edge(NODE_MEMORY_WRITER, END)
 
         # 编译工作流
         compiled_graph = workflow.compile(checkpointer=self.checkpointer)
 
         logger.info("工作流图构建完成")
         return compiled_graph
+
+    async def _initialize_persistence(self) -> None:
+        """异步初始化持久化存储（首次调用时执行）
+
+        - 初始化 AsyncSqliteSaver（失败降级为 MemorySaver）
+        - 创建 aiops_experiences 经验表
+        - 用持久化 checkpointer 重建 graph（绑定 memory_writer）
+
+        对应记忆工程：State 持久化 + 经验回写闭环。
+        """
+        if self._persistence_initialized:
+            return
+
+        try:
+            self._sqlite_conn = await aiosqlite.connect(config.sqlite_db_path)
+            self.checkpointer = AsyncSqliteSaver(self._sqlite_conn)
+            await self.checkpointer.setup()
+            logger.info(f"AsyncSqliteSaver 初始化成功: {config.sqlite_db_path}")
+
+            # 创建经验表（独立于 checkpoint 表）
+            await init_experiences_table(self._sqlite_conn)
+
+            # 用持久化 checkpointer + sqlite_conn 重建 graph
+            self.graph = self._build_graph()
+            logger.info("工作流已切换为持久化模式（AsyncSqliteSaver + memory_writer）")
+        except Exception as e:
+            logger.error(f"AsyncSqliteSaver 初始化失败，降级为 MemorySaver: {e}")
+            self._sqlite_conn = None
+            self.checkpointer = MemorySaver()
+            self.graph = self._build_graph()
+
+        self._persistence_initialized = True
 
     async def execute(
         self,
@@ -96,6 +152,9 @@ class AIOpsService:
         logger.info(f"[会话 {session_id}] 开始执行任务: {user_input}")
 
         try:
+            # 初始化持久化（首次调用时建立 AsyncSqliteSaver + 经验表，重建 graph）
+            await self._initialize_persistence()
+
             # 初始化状态
             initial_state: PlanExecuteState = {
                 "input": user_input,
@@ -129,6 +188,9 @@ class AIOpsService:
 
                     elif node_name == NODE_REPLANNER:
                         yield self._format_replanner_event(node_output)
+
+                    elif node_name == NODE_MEMORY_WRITER:
+                        yield self._format_memory_writer_event(node_output)
 
             # 获取最终状态
             final_state = self.graph.get_state(config_dict)
@@ -335,6 +397,26 @@ class AIOpsService:
                 "message": f"评估完成，{'继续执行剩余步骤' if plan else '准备生成最终响应'}",
                 "remaining_steps": len(plan)
             }
+
+    def _format_memory_writer_event(self, state: Dict | None) -> Dict:
+        """格式化经验回写节点事件"""
+        return {
+            "type": "status",
+            "stage": "memory_written",
+            "message": "任务经验已写入长期记忆（Milvus + SQLite）"
+        }
+
+    async def cleanup(self) -> None:
+        """清理资源（关闭 SQLite 连接）"""
+        if self._sqlite_conn is not None:
+            try:
+                await self._sqlite_conn.close()
+                logger.info("AIOps SQLite 连接已关闭")
+            except Exception as e:
+                logger.warning(f"关闭 AIOps SQLite 连接失败: {e}")
+            finally:
+                self._sqlite_conn = None
+                self._persistence_initialized = False
 
 
 # 全局单例

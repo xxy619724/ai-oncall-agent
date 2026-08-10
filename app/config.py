@@ -26,6 +26,7 @@ class Settings(BaseSettings):
 
     # DashScope 配置
     dashscope_api_key: str = ""  # 默认空字符串，实际使用需从环境变量加载
+    dashscope_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # 国内站点（默认勿用国际站 dashscope-intl）
     dashscope_model: str = "qwen-max"
     dashscope_embedding_model: str = "text-embedding-v4"  # v4 支持多种维度（默认 1024）
 
