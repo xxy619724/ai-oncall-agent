@@ -12,6 +12,7 @@ from loguru import logger
 from app.config import config
 from app.tools import DEFAULT_LOCAL_AGENT_TOOLS
 from app.agent.mcp_client import get_mcp_client_with_retry
+from app.services.llm_semaphore import get_llm_semaphore
 from .state import PlanExecuteState
 from app.observability import trace_node
 
@@ -86,8 +87,9 @@ async def executor(state: PlanExecuteState) -> Dict[str, Any]:
             HumanMessage(content=f"请执行以下任务: {task}")
         ]
 
-        # 第一步：LLM 决定是否调用工具
-        llm_response = await llm_with_tools.ainvoke(messages)
+        # 第一步：LLM 决定是否调用工具（受 LLM 并发信号量控制）
+        async with get_llm_semaphore():
+            llm_response = await llm_with_tools.ainvoke(messages)
         logger.info(f"LLM 响应类型: {type(llm_response)}")
 
         # 提取 LLM 响应的 Token 用量（如果模型返回了 usage_metadata）
@@ -142,9 +144,10 @@ async def executor(state: PlanExecuteState) -> Dict[str, Any]:
                     )
             # ===== 埋点结束 =====
 
-            # 第三步：将工具结果返回给 LLM 生成最终答案
+            # 第三步：将工具结果返回给 LLM 生成最终答案（受 LLM 并发信号量控制）
             messages.extend(tool_messages["messages"])
-            final_response = await llm_with_tools.ainvoke(messages)
+            async with get_llm_semaphore():
+                final_response = await llm_with_tools.ainvoke(messages)
             result = final_response.content if hasattr(final_response, 'content') else str(final_response)
 
             # 提取最终 LLM 响应的 Token 用量，累计到 trace

@@ -13,6 +13,7 @@ from loguru import logger
 from app.config import config
 from app.tools import DEFAULT_LOCAL_AGENT_TOOLS
 from app.agent.mcp_client import get_mcp_client_with_retry
+from app.services.llm_semaphore import get_llm_semaphore
 from .state import PlanExecuteState
 from .utils import format_tools_description
 from app.observability import trace_node
@@ -187,10 +188,12 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
                 ("user", f"⚠️ 重要提示：已执行 {len(past_steps)} 个步骤，请优先考虑是否信息已足够生成响应（respond）")
             ]
 
-            act = await replanner_chain.ainvoke({
-                "messages": messages,
-                "tools_description": tools_description
-            })
+            # 受 LLM 并发信号量控制
+            async with get_llm_semaphore():
+                act = await replanner_chain.ainvoke({
+                    "messages": messages,
+                    "tools_description": tools_description
+                })
 
             # 处理返回结果
             if isinstance(act, Act):
@@ -265,7 +268,9 @@ async def _generate_response(state: PlanExecuteState, llm: ChatQwen) -> Dict[str
             ("user", "请基于以上信息生成全面的最终响应")
         ]
 
-        response_obj = await response_gen.ainvoke({"messages": messages})
+        # 受 LLM 并发信号量控制
+        async with get_llm_semaphore():
+            response_obj = await response_gen.ainvoke({"messages": messages})
 
         # 处理返回结果
         if isinstance(response_obj, Response):

@@ -86,6 +86,16 @@ class Settings(BaseSettings):
     observability_span_output_max_len: int = 500  # Span 输出摘要截断长度（字符）
     observability_trace_input_max_len: int = 500  # Trace 输入截断长度（字符）
 
+    # 异步任务系统配置（阶段一：最小可用异步任务系统）
+    task_db_path: str = "./data/tasks.db"         # 任务状态持久化 SQLite（独立库）
+    task_queue_maxsize: int = 100                  # 任务队列容量（满时返回 503）
+    task_timeout_seconds: int = 300                # 任务执行硬超时（秒），超时标记 failed
+    task_event_buffer_size: int = 200              # 单任务事件缓冲区大小（内存）
+    task_worker_concurrency: int = 1               # Worker 并发数（阶段一固定为 1）
+
+    # LLM 并发控制（防止 API 限流 + httpx 连接池耗尽）
+    llm_concurrency_limit: int = 3                 # 同时调用 LLM 的最大数量
+
     @property
     def mcp_servers(self) -> Dict[str, Dict[str, Any]]:
         """获取完整的 MCP 服务器配置"""

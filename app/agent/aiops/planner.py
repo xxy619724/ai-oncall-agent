@@ -11,8 +11,10 @@ from pydantic import BaseModel, Field
 from loguru import logger
 
 from app.config import config
-from app.tools import DEFAULT_LOCAL_AGENT_TOOLS, retrieve_knowledge
+from app.tools import DEFAULT_LOCAL_AGENT_TOOLS
+from app.agent.sub_agents import sub_agent_tool
 from app.agent.mcp_client import get_mcp_client_with_retry
+from app.services.llm_semaphore import get_llm_semaphore
 from .state import PlanExecuteState
 from .utils import format_tools_description
 from app.observability import trace_node
@@ -76,13 +78,19 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
     logger.info(f"用户输入: {input_text}")
 
     try:
-        # 步骤1: 查询内部文档获取相关经验
-        logger.info("查询内部文档，寻找相关经验...")
+        # 步骤1: 通过 KnowledgeAgent 子 Agent 查询内部文档获取相关经验
+        # 改造点：原来直接 ainvoke retrieve_knowledge，现在通过 sub_agent_tool
+        # 调用 KnowledgeAgent 子 Agent，在独立上下文中执行检索，避免污染主流程
+        logger.info("调用 KnowledgeAgent 子 Agent 检索经验...")
         experience_docs = ""
         try:
-            # retrieve_knowledge 使用 response_format="content_and_artifact"
-            # ainvoke() 只返回 content（字符串），不是元组
-            context_str = await retrieve_knowledge.ainvoke({"query": input_text})
+            # sub_agent_tool 内部会调用 KnowledgeAgent.run_to_completion()
+            # KnowledgeAgent 工具集=[retrieve_knowledge]，max_turns=3
+            context_str = await sub_agent_tool.ainvoke({
+                "subagent_type": "knowledge_agent",
+                "prompt": f"检索与以下任务相关的知识、经验和最佳实践: {input_text}",
+                "description": "为规划阶段提供经验支撑"
+            })
             if context_str and context_str.strip():
                 experience_docs = context_str
                 logger.info(f"找到相关经验文档，长度: {len(experience_docs)}")
@@ -134,12 +142,13 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
 
         planner_chain = planner_prompt | llm.with_structured_output(Plan)
 
-        # 调用 LLM 生成计划
-        plan_result = await planner_chain.ainvoke({
-            "messages": [("user", input_text)],
-            "tools_description": tools_description,
-            "experience_context": experience_context
-        })
+        # 调用 LLM 生成计划（受 LLM 并发信号量控制）
+        async with get_llm_semaphore():
+            plan_result = await planner_chain.ainvoke({
+                "messages": [("user", input_text)],
+                "tools_description": tools_description,
+                "experience_context": experience_context
+            })
 
         # 提取步骤列表
         if isinstance(plan_result, Plan):

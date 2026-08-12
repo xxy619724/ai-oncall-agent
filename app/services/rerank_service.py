@@ -60,15 +60,17 @@ class RerankService:
                 response.raise_for_status()
                 result = response.json()
 
-            results = result.get("output", {}).get("results", [])
-            sorted_results = sorted(results, key=lambda x: x.get("relevance_score", 0), reverse=True)
+            # 兼容两种返回格式：新版顶层 results / 旧版 output.results
+            results = result.get("results") or result.get("output", {}).get("results", [])
+            sorted_results = sorted(results, key=lambda x: x.get("relevance_score", x.get("score", 0)), reverse=True)
 
             reranked_docs = []
             for r in sorted_results:
                 idx = r.get("index", 0)
                 if idx < len(documents):
                     doc = documents[idx]
-                    doc.metadata["rerank_score"] = r.get("relevance_score", 0.0)
+                    score = r.get("relevance_score", r.get("score", 0.0))
+                    doc.metadata["rerank_score"] = score
                     reranked_docs.append(doc)
 
             for i, doc in enumerate(reranked_docs):

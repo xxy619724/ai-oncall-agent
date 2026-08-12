@@ -12,9 +12,11 @@ import os
 
 from app.config import config
 from loguru import logger
-from app.api import chat, health, file, aiops
+from app.api import chat, health, file, aiops, task
 from app.core.milvus_client import milvus_manager
 from app.observability import observability_store
+from app.services.task_service import init_task_service, cleanup_task_service
+from app.services.task_worker import start_task_worker, stop_task_worker
 
 
 @asynccontextmanager
@@ -48,12 +50,22 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("⚠️ 可观测数据存储未就绪（埋点将降级为零开销直通）")
 
+    # 初始化异步任务系统（TaskService + TaskWorker）
+    logger.info("📋 正在初始化异步任务系统...")
+    await init_task_service()
+    await start_task_worker()
+    logger.info("✅ 异步任务系统已就绪（POST /api/tasks 提交，GET /api/tasks/{id} 查询）")
+
     logger.info("=" * 60)
 
     yield
 
     # 关闭时执行
     logger.info("🔌 正在关闭服务...")
+
+    # 停止异步任务 Worker
+    await stop_task_worker()
+    await cleanup_task_service()
 
     # 清理 RAG Agent 资源（SQLite + Redis）
     from app.services.rag_agent_service import rag_agent_service
@@ -86,6 +98,7 @@ app.include_router(health.router, tags=["健康检查"])
 app.include_router(chat.router, prefix="/api", tags=["对话"])
 app.include_router(file.router, prefix="/api", tags=["文件管理"])
 app.include_router(aiops.router, prefix="/api", tags=["AIOps智能运维"])
+app.include_router(task.router, prefix="/api", tags=["异步任务系统"])
 
 # 挂载静态文件
 static_dir = "static"
