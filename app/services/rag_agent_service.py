@@ -6,6 +6,7 @@
 
 from typing import Any, AsyncGenerator, Dict
 
+import asyncio
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,6 +18,7 @@ from langchain_qwq import ChatQwen
 
 from app.config import config
 from app.tools import DEFAULT_LOCAL_AGENT_TOOLS
+from app.services.semantic_cache_service import semantic_cache_service
 from app.agent.mcp_client import (
     get_mcp_client_with_retry,
     load_mcp_tools_safe,
@@ -38,7 +40,9 @@ class RagAgentService:
         Args:
             streaming: 是否启用流式输出，默认为 True
         """
-        self.model_name = config.rag_model
+        # 聊天链路使用多模态模型（qwen-vl-max）：支持用户发送图片，
+        # 纯文本请求完全兼容，工具调用（function calling）同样支持
+        self.model_name = config.chat_model
         self.streaming = streaming
         self.system_prompt = self._build_system_prompt()
 
@@ -66,6 +70,9 @@ class RagAgentService:
         # Agent 初始化（会在异步方法中完成）
         self.agent = None
         self._agent_initialized = False
+
+        # 主动终止注册表：session_id → 停止标记（流式输出中逐 token 检查）
+        self._stop_flags: Dict[str, asyncio.Event] = {}
 
         logger.info(f"RAG Agent 服务初始化完成 (ChatQwen), model={self.model_name}, streaming={streaming}")
 
@@ -106,10 +113,16 @@ class RagAgentService:
             from app.services.checkpoint_cleaner import SqliteCheckpointCleaner
             self._cleaner = SqliteCheckpointCleaner(self._sqlite_conn)
             await self._cleaner.start_periodic_cleanup()
+
+            # 初始化经验 TTL 清理器并启动定时任务（软删除过期经验）
+            from app.services.experience_ttl_cleaner import ExperienceTtlCleaner
+            self._ttl_cleaner = ExperienceTtlCleaner(self._sqlite_conn)
+            await self._ttl_cleaner.start_periodic_cleanup()
         except Exception as e:
             logger.error(f"AsyncSqliteSaver 初始化失败，降级为 MemorySaver: {e}")
             self._sqlite_conn = None
             self._cleaner = None
+            self._ttl_cleaner = None
             self.checkpointer = MemorySaver()
 
         # 上下文自动压缩中间件：两层记忆架构
@@ -172,10 +185,40 @@ class RagAgentService:
             请根据用户的问题，灵活使用可用工具，提供高质量的帮助。
         """).strip()
 
+    @staticmethod
+    def _build_message_content(question: str, image_data_url: str = "") -> Any:
+        """构建消息内容：无图时返回纯文本，带图时返回多模态 content 块列表
+
+        Args:
+            question: 用户问题文本
+            image_data_url: 可选图片，完整 dataURL（data:image/png;base64,...）
+
+        Returns:
+            str 或 list: LangChain 消息 content（多模态时为 content 块列表）
+        """
+        image_data_url = (image_data_url or "").strip()
+
+        # 图片大小校验：防止 base64 撑爆 checkpoint 和 API 请求
+        if image_data_url and len(image_data_url) > config.chat_image_max_base64_size:
+            raise ValueError(
+                f"图片过大: base64 长度 {len(image_data_url)} 超过上限 "
+                f"{config.chat_image_max_base64_size}，请压缩后重试"
+            )
+
+        if not image_data_url:
+            return question
+
+        # 多模态 content 块：文本块 + 图片块（qwen-vl 兼容 OpenAI image_url 格式）
+        return [
+            {"type": "text", "text": question or "请识别这张图片"},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+        ]
+
     async def query(
         self,
         question: str,
         session_id: str,
+        image_data_url: str = "",
     ) -> str:
         """
         非流式处理用户问题（一次性返回完整答案）
@@ -183,17 +226,29 @@ class RagAgentService:
         Args:
             question: 用户问题
             session_id: 会话ID（作为 thread_id）
+            image_data_url: 可选图片（dataURL 格式），用于多模态识别
 
         Returns:
             str: 完整答案
         """
         try:
+            # P1 语义缓存：命中直接返回完整回答（跳过检索 + 生成）
+            # 图片问题不缓存（视觉识别结果时效性差、复用价值低）
+            if config.semantic_cache_enabled and not image_data_url:
+                cached = await asyncio.to_thread(
+                    semantic_cache_service.lookup, question
+                )
+                if cached is not None:
+                    logger.info(f"[会话 {session_id}] 语义缓存命中，直接返回")
+                    return cached
+
             await self._initialize_agent()
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（非流式）: {question}")
 
             # system prompt 由 agent 托管（create_agent 时注入），无需重复传入
-            messages = [HumanMessage(content=question)]
+            content = self._build_message_content(question, image_data_url)
+            messages = [HumanMessage(content=content)]
 
             # 构建 Agent 输入
             agent_input = {"messages": messages}
@@ -235,6 +290,12 @@ class RagAgentService:
                         session_id, message_count=len(messages_result)
                     )
 
+                # P1 语义缓存：写入完整回答（失败内部静默降级，不影响返回）
+                if config.semantic_cache_enabled and not image_data_url and answer:
+                    await asyncio.to_thread(
+                        semantic_cache_service.store, question, str(answer)
+                    )
+
                 return answer
 
             logger.warning(f"[会话 {session_id}] Agent 返回结果为空")
@@ -251,6 +312,7 @@ class RagAgentService:
         self,
         question: str,
         session_id: str,
+        image_data_url: str = "",
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         流式处理用户问题（逐步返回答案片段）
@@ -258,19 +320,36 @@ class RagAgentService:
         Args:
             question: 用户问题
             session_id: 会话ID（作为 thread_id）
+            image_data_url: 可选图片（dataURL 格式），用于多模态识别
 
         Yields:
             Dict[str, Any]: 包含流式数据的字典
-                - type: "content" | "tool_call" | "complete" | "error"
+                - type: "content" | "tool_call" | "complete" | "stopped" | "error"
                 - data: 具体内容
         """
+        # 注册停止标记（新事件覆盖旧条目，天然忽略历史残留的停止请求）
+        stop_event = asyncio.Event()
+        self._stop_flags[session_id] = stop_event
+
         try:
+            # P1 语义缓存：命中直接返回完整回答（一次性推送给前端）
+            if config.semantic_cache_enabled and not image_data_url:
+                cached = await asyncio.to_thread(
+                    semantic_cache_service.lookup, question
+                )
+                if cached is not None:
+                    logger.info(f"[会话 {session_id}] 语义缓存命中（流式）")
+                    yield {"type": "content", "data": cached}
+                    yield {"type": "complete"}
+                    return
+
             await self._initialize_agent()
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（流式）: {question}")
 
             # system prompt 由 agent 托管（create_agent 时注入），无需重复传入
-            messages = [HumanMessage(content=question)]
+            content = self._build_message_content(question, image_data_url)
+            messages = [HumanMessage(content=content)]
 
             # 构建 Agent 输入
             agent_input = {"messages": messages}
@@ -282,11 +361,18 @@ class RagAgentService:
                 }
             }
 
+            stopped = False
+            full_answer = ""  # 累计完整回答（语义缓存写入用）
             async for token, metadata in self.agent.astream(
                 input=agent_input,
                 config=config_dict,
                 stream_mode="messages",
             ):
+                # 主动终止：token 边界检查停止标记，命中即中断流式输出
+                if stop_event.is_set():
+                    stopped = True
+                    break
+
                 node_name = metadata.get('langgraph_node', 'unknown') if isinstance(metadata, dict) else 'unknown'
                 message_type = type(token).__name__
 
@@ -298,11 +384,19 @@ class RagAgentService:
                             if isinstance(block, dict) and block.get('type') == 'text':
                                 text_content = block.get('text', '')
                                 if text_content:
+                                    full_answer += text_content
                                     yield {
                                         "type": "content",
                                         "data": text_content,
                                         "node": node_name
                                     }
+
+            if stopped:
+                # 用户主动终止：跳过摘要同步与缓存写入（本轮回答未完成，不入 checkpoint），
+                # 已生成的部分内容已通过 content 事件推给前端
+                logger.info(f"[会话 {session_id}] 收到停止请求，流式输出已终止")
+                yield {"type": "stopped"}
+                return
 
             logger.info(f"[会话 {session_id}] RAG Agent 查询完成（流式）")
 
@@ -316,6 +410,12 @@ class RagAgentService:
             if self._cleaner:
                 await self._cleaner.touch_session(session_id)
 
+            # P1 语义缓存：写入完整回答（失败内部静默降级）
+            if config.semantic_cache_enabled and not image_data_url and full_answer:
+                await asyncio.to_thread(
+                    semantic_cache_service.store, question, full_answer
+                )
+
             yield {"type": "complete"}
 
         except Exception as e:
@@ -324,6 +424,48 @@ class RagAgentService:
                 f"[会话 {session_id}] RAG Agent 查询失败（流式）: {detail}"
             )
             yield {"type": "error", "data": detail}
+
+        finally:
+            # 流结束（正常/停止/异常）后清理注册表，防止内存泄漏
+            self._stop_flags.pop(session_id, None)
+
+    def request_stop(self, session_id: str) -> bool:
+        """请求终止指定会话的流式输出（由 /chat/stop 调用）
+
+        Args:
+            session_id: 会话 ID
+
+        Returns:
+            bool: True 表示找到运行中的流式任务并已设置停止标记；
+                  False 表示该会话当前没有正在进行的流式输出
+        """
+        stop_event = self._stop_flags.get(session_id)
+        if stop_event is None:
+            return False
+        stop_event.set()
+        logger.info(f"[会话 {session_id}] 收到主动终止请求")
+        return True
+
+    @staticmethod
+    def _extract_text_content(content: Any) -> str:
+        """提取消息文本：多模态 content（list 块）只取文本块，防止 base64 泄漏到前端
+
+        Args:
+            content: 消息 content（str 或多模态 content 块 list）
+
+        Returns:
+            str: 纯文本内容
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            return " ".join(p for p in parts if p)
+        return str(content)
 
     async def aget_session_history(self, session_id: str) -> list:
         """获取会话历史（委托给 MemoryService）
@@ -364,7 +506,10 @@ class RagAgentService:
                 if isinstance(msg, SystemMessage):
                     continue
                 role = "user" if isinstance(msg, HumanMessage) else "assistant"
-                content = msg.content if hasattr(msg, 'content') else str(msg)
+                # 多模态消息 content 为 list 块，只提取文本块（防止 base64 泄漏到前端）
+                content = self._extract_text_content(
+                    msg.content if hasattr(msg, 'content') else str(msg)
+                )
                 timestamp = getattr(msg, 'timestamp', None)
                 if not timestamp:
                     from datetime import datetime
@@ -412,6 +557,10 @@ class RagAgentService:
             # 停止 Checkpoint 清理器
             if self._cleaner:
                 await self._cleaner.stop()
+
+            # 停止经验 TTL 清理器
+            if hasattr(self, "_ttl_cleaner") and self._ttl_cleaner:
+                await self._ttl_cleaner.stop()
 
             # 关闭 MemoryService Redis 连接
             from app.services.memory_service import get_memory_service

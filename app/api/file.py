@@ -40,6 +40,13 @@ async def upload_file(file: UploadFile = File(...)):
         # 3. 验证文件扩展名
         file_extension = _get_file_extension(safe_filename)
         if file_extension not in ALLOWED_EXTENSIONS:
+            # .doc 旧格式单独提示转换方式（P1：友好报错）
+            if file_extension == "doc":
+                raise HTTPException(
+                    status_code=400,
+                    detail="检测到 .doc 旧格式（Word 97-2003 二进制格式），暂不支持。"
+                    "请用 Word 打开后另存为 .docx 再上传",
+                )
             raise HTTPException(
                 status_code=400,
                 detail=f"不支持的文件格式，仅支持: {', '.join(ALLOWED_EXTENSIONS)}",

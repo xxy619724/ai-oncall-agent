@@ -1,6 +1,6 @@
 """向量存储管理器 - 封装 Milvus VectorStore 操作"""
 
-from typing import List
+from typing import List, Optional
 
 from langchain_core.documents import Document
 from langchain_milvus import Milvus
@@ -129,24 +129,45 @@ class VectorStoreManager:
         """
         return self.vector_store
 
-    def similarity_search(self, query: str, k: int = 3) -> List[Document]:
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 3,
+        expr: Optional[str] = None,
+    ) -> List[Document]:
         """
         相似度搜索（使用 COSINE 余弦相似度）
 
         Args:
             query: 查询文本
             k: 返回结果数量
+            expr: Milvus 标量过滤表达式（如 "metadata['status'] != 'deprecated'"）；
+                  None 表示不过滤
 
         Returns:
             List[Document]: 相关文档列表
         """
         try:
             search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
-            docs = self.vector_store.similarity_search(query, k=k, param=search_params)
-            logger.debug(f"相似度搜索完成: query='{query}', 结果数={len(docs)}")
+            docs = self.vector_store.similarity_search(
+                query, k=k, param=search_params, expr=expr
+            )
+            logger.debug(
+                f"相似度搜索完成: query='{query}', 结果数={len(docs)}, expr={expr}"
+            )
             return docs
         except Exception as e:
-            logger.error(f"相似度搜索失败: {e}")
+            logger.error(f"相似度搜索失败: {e}, expr={expr}")
+            # expr 失败降级到无过滤重试
+            if expr is not None:
+                logger.warning(f"expr 过滤失败，降级无过滤重试: {expr}")
+                try:
+                    docs = self.vector_store.similarity_search(
+                        query, k=k, param=search_params
+                    )
+                    return docs
+                except Exception as fallback_err:
+                    logger.error(f"降级重试也失败: {fallback_err}")
             return []
 
 

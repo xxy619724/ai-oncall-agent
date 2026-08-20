@@ -868,6 +868,30 @@ body {
     height: 20px;
 }
 
+/* 流式输出中：发送按钮变为停止按钮 */
+.send-btn-circle.stop-mode {
+    background: #fdecea;
+    color: #d93025;
+}
+
+.send-btn-circle.stop-mode:hover {
+    background: #f9d7d5;
+    color: #b3261e;
+}
+
+/* 停止图标：白色描边方块（替代发送箭头的视觉暗示） */
+.send-btn-circle.stop-mode svg {
+    display: none;
+}
+
+.send-btn-circle.stop-mode::after {
+    content: '';
+    width: 12px;
+    height: 12px;
+    background: currentColor;
+    border-radius: 2px;
+}
+
 /* 自定义滚动条 */
 .chat-messages::-webkit-scrollbar {
     width: 8px;
@@ -1162,4 +1186,57 @@ body {
         width: 100%;
         right: 0;
     }
+}
+
+/* ===== 图片发送（多模态） ===== */
+
+/* 用户消息中的图片缩略图 */
+.message-image {
+    max-width: 200px;
+    max-height: 200px;
+    border-radius: 12px;
+    display: block;
+    margin-bottom: 6px;
+    object-fit: cover;
+}
+
+/* 输入区上方的图片预览条 */
+.image-preview-bar {
+    position: relative;
+    display: inline-flex;
+    padding: 6px;
+    background: #f1f3f4;
+    border: 1px solid #dadce0;
+    border-radius: 12px;
+    margin-bottom: 8px;
+}
+
+.image-preview-bar img {
+    width: 72px;
+    height: 72px;
+    object-fit: cover;
+    border-radius: 8px;
+    display: block;
+}
+
+.image-preview-remove {
+    position: absolute;
+    top: -8px;
+    right: -8px;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: none;
+    background: #5f6368;
+    color: #fff;
+    font-size: 14px;
+    line-height: 22px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.image-preview-remove:hover {
+    background: #ea4335;
 }

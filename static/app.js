@@ -8,12 +8,15 @@ class SuperBizAgentApp {
         this.currentChatHistory = []; // 当前对话的消息历史
         this.chatHistories = this.loadChatHistories(); // 所有历史对话
         this.isCurrentChatFromHistory = false; // 标记当前对话是否是从历史记录加载的
+        this.pendingImage = null; // 待发送的图片 dataURL（多模态）
+        this.activeReader = null; // 当前流式输出的 reader（供停止按钮中断）
         
         this.initializeElements();
         this.bindEvents();
         this.updateUI();
         this.initMarkdown();
         this.checkAndSetCentered();
+        this.restorePendingQuestion(); // 恢复未发送成功的问题（P0-4）
         this.renderChatHistory();
     }
 
@@ -109,6 +112,9 @@ class SuperBizAgentApp {
         this.modeDropdown = document.getElementById('modeDropdown');
         this.currentModeText = document.getElementById('currentModeText');
         this.fileInput = document.getElementById('fileInput');
+        this.uploadImageItem = document.getElementById('uploadImageItem');
+        this.imageInput = document.getElementById('imageInput');
+        this.imagePreviewBar = document.getElementById('imagePreviewBar');
         
         // 聊天区域元素
         this.chatMessages = document.getElementById('chatMessages');
@@ -159,16 +165,26 @@ class SuperBizAgentApp {
             }
         });
         
-        // 发送消息
+        // 发送消息（流式输出中变为"停止"按钮）
         if (this.sendButton) {
-            this.sendButton.addEventListener('click', () => this.sendMessage());
+            this.sendButton.addEventListener('click', () => {
+                if (this.isStreaming && this.currentMode === 'stream') {
+                    this.stopGeneration();
+                } else {
+                    this.sendMessage();
+                }
+            });
         }
-        
+
         if (this.messageInput) {
             this.messageInput.addEventListener('keypress', (e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault();
-                    this.sendMessage();
+                    if (this.isStreaming && this.currentMode === 'stream') {
+                        this.stopGeneration();
+                    } else {
+                        this.sendMessage();
+                    }
                 }
             });
         }
@@ -202,6 +218,20 @@ class SuperBizAgentApp {
         
         if (this.fileInput) {
             this.fileInput.addEventListener('change', (e) => this.handleFileSelect(e));
+        }
+
+        // 发送图片（多模态）
+        if (this.uploadImageItem) {
+            this.uploadImageItem.addEventListener('click', () => {
+                if (this.imageInput) {
+                    this.imageInput.click();
+                }
+                this.closeToolsMenu();
+            });
+        }
+
+        if (this.imageInput) {
+            this.imageInput.addEventListener('change', (e) => this.handleImageSelect(e));
         }
     }
 
@@ -608,9 +638,12 @@ class SuperBizAgentApp {
             }
         });
         
-        // 更新发送按钮状态
+        // 更新发送按钮状态（流式模式下输出中变为"停止"按钮）
         if (this.sendButton) {
-            this.sendButton.disabled = this.isStreaming;
+            const canStop = this.isStreaming && this.currentMode === 'stream';
+            this.sendButton.disabled = this.isStreaming && !canStop;
+            this.sendButton.classList.toggle('stop-mode', canStop);
+            this.sendButton.title = canStop ? '停止生成' : '发送';
         }
         
         // 更新输入框状态
@@ -631,9 +664,10 @@ class SuperBizAgentApp {
         if (this.messageInput) {
             message = this.messageInput.value.trim();
         }
-        
-        if (!message) {
-            this.showNotification('请输入消息内容', 'warning');
+
+        // 图片和文字至少有一样
+        if (!message && !this.pendingImage) {
+            this.showNotification('请输入消息内容或添加图片', 'warning');
             return;
         }
 
@@ -642,9 +676,14 @@ class SuperBizAgentApp {
             return;
         }
 
-        // 显示用户消息
-        this.addMessage('user', message);
-        
+        // 显示用户消息（带图片缩略图）
+        this.addMessage('user', message || '（图片）', false, true, this.pendingImage);
+
+        // 记录待发送的图片并清空预览
+        const imageToSend = this.pendingImage;
+        this.pendingImage = null;
+        this.renderImagePreview();
+
         // 清空输入框
         if (this.messageInput) {
             this.messageInput.value = '';
@@ -654,15 +693,21 @@ class SuperBizAgentApp {
         this.isStreaming = true;
         this.updateUI();
 
+        // 断网保护：发送前暂存问题，成功后清除（P0-4）
+        this.savePendingQuestion(message);
+
         try {
             if (this.currentMode === 'quick') {
-                await this.sendQuickMessage(message);
+                await this.sendQuickMessage(message, imageToSend);
             } else if (this.currentMode === 'stream') {
-                await this.sendStreamMessage(message);
+                await this.sendStreamMessage(message, imageToSend);
             }
+            // 请求成功（含用户主动停止：问题已送达后端）→ 清除暂存
+            this.clearPendingQuestion();
         } catch (error) {
             console.error('发送消息失败:', error);
             this.addMessage('assistant', '抱歉，发送消息时出现错误：' + error.message);
+            // 保留暂存的问题，刷新页面后可恢复到输入框重新发送
         } finally {
             this.isStreaming = false;
             this.updateUI();
@@ -676,10 +721,10 @@ class SuperBizAgentApp {
     }
 
     // 发送快速消息（普通对话）
-    async sendQuickMessage(message) {
+    async sendQuickMessage(message, image = null) {
         // 添加等待提示消息
         const loadingMessage = this.addLoadingMessage('正在思考...');
-        
+
         try {
             const response = await fetch(`${this.apiBaseUrl}/chat`, {
                 method: 'POST',
@@ -688,7 +733,8 @@ class SuperBizAgentApp {
                 },
                 body: JSON.stringify({
                     Id: this.sessionId,
-                    Question: message
+                    Question: message || '请识别这张图片',
+                    ...(image ? { Image: image } : {})
                 })
             });
 
@@ -735,7 +781,7 @@ class SuperBizAgentApp {
     }
 
     // 发送流式消息
-    async sendStreamMessage(message) {
+    async sendStreamMessage(message, image = null) {
         try {
             const response = await fetch(`${this.apiBaseUrl}/chat_stream`, {
                 method: 'POST',
@@ -744,7 +790,8 @@ class SuperBizAgentApp {
                 },
                 body: JSON.stringify({
                     Id: this.sessionId,
-                    Question: message
+                    Question: message || '请识别这张图片',
+                    ...(image ? { Image: image } : {})
                 })
             });
 
@@ -755,9 +802,11 @@ class SuperBizAgentApp {
             // 创建助手消息元素
             const assistantMessageElement = this.addMessage('assistant', '', true);
             let fullResponse = '';
+            let streamFinished = false; // 防止 stopped/done 双重触发完成处理
 
             // 处理流式响应
             const reader = response.body.getReader();
+            this.activeReader = reader; // 供停止按钮中断本地读取
             const decoder = new TextDecoder();
             let buffer = '';
             let currentEvent = '';
@@ -765,10 +814,13 @@ class SuperBizAgentApp {
             try {
                 while (true) {
                     const { done, value } = await reader.read();
-                    
+
                     if (done) {
                         // 流结束，使用统一的处理方法
-                        this.handleStreamComplete(assistantMessageElement, fullResponse);
+                        if (!streamFinished) {
+                            streamFinished = true;
+                            this.handleStreamComplete(assistantMessageElement, fullResponse);
+                        }
                         break;
                     }
 
@@ -803,7 +855,10 @@ class SuperBizAgentApp {
                             // 兼容旧格式 [DONE] 标记
                             if (rawData === '[DONE]') {
                                 // 流结束标记，将内容转换为Markdown渲染
-                                this.handleStreamComplete(assistantMessageElement, fullResponse);
+                                if (!streamFinished) {
+                                    streamFinished = true;
+                                    this.handleStreamComplete(assistantMessageElement, fullResponse);
+                                }
                                 return;
                             }
                             
@@ -829,7 +884,18 @@ class SuperBizAgentApp {
                                         }
                                     } else if (sseMessage.type === 'done') {
                                         console.log('[SSE调试] 收到done标记，流结束');
-                                        this.handleStreamComplete(assistantMessageElement, fullResponse);
+                                        if (!streamFinished) {
+                                            streamFinished = true;
+                                            this.handleStreamComplete(assistantMessageElement, fullResponse);
+                                        }
+                                        return;
+                                    } else if (sseMessage.type === 'stopped') {
+                                        // 用户主动终止：保留已生成的部分内容并结束渲染
+                                        console.log('[SSE调试] 收到stopped标记，输出已被用户终止');
+                                        if (!streamFinished) {
+                                            streamFinished = true;
+                                            this.handleStreamComplete(assistantMessageElement, fullResponse);
+                                        }
                                         return;
                                     } else if (sseMessage.type === 'error') {
                                         console.error('[SSE调试] 收到错误:', sseMessage.data);
@@ -871,26 +937,94 @@ class SuperBizAgentApp {
                 }
             } finally {
                 reader.releaseLock();
+                this.activeReader = null;
             }
         } catch (error) {
             throw error;
         }
     }
 
+    // 主动终止流式输出（P0-3：调用后端 /chat/stop + 中断本地读取）
+    async stopGeneration() {
+        if (!this.isStreaming) return;
+        console.log('[停止] 用户请求终止流式输出');
+
+        // 通知后端设置停止标记（下一个 token 边界中断生成）
+        try {
+            await fetch(`${this.apiBaseUrl}/chat/stop`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    sessionId: this.sessionId
+                })
+            });
+        } catch (e) {
+            // 后端停止请求失败不阻塞本地中断
+            console.warn('[停止] 停止请求发送失败（可能已断网）:', e);
+        }
+
+        // 中断本地 SSE 读取循环（read() 立即以 done 结束）
+        if (this.activeReader) {
+            try {
+                await this.activeReader.cancel();
+            } catch (e) {
+                console.warn('[停止] 中断读取失败:', e);
+            }
+        }
+    }
+
+    // 暂存待发送的问题（P0-4：断网保护）
+    savePendingQuestion(question) {
+        if (!question) return;
+        try {
+            localStorage.setItem('pending_question', question);
+        } catch (e) {
+            console.warn('问题暂存失败:', e);
+        }
+    }
+
+    // 清除暂存的问题（请求成功后调用）
+    clearPendingQuestion() {
+        try {
+            localStorage.removeItem('pending_question');
+        } catch (e) {
+            console.warn('清除暂存问题失败:', e);
+        }
+    }
+
+    // 恢复未发送成功的问题到输入框（页面加载时调用，手动确认重发）
+    restorePendingQuestion() {
+        try {
+            const pending = localStorage.getItem('pending_question');
+            if (pending) {
+                localStorage.removeItem('pending_question');
+                if (this.messageInput) {
+                    this.messageInput.value = pending;
+                }
+                this.showNotification('检测到上次未发送成功的问题，已恢复到输入框，请确认后重新发送', 'info');
+            }
+        } catch (e) {
+            console.warn('恢复暂存问题失败:', e);
+        }
+    }
+
     // 添加消息到聊天界面
-    addMessage(type, content, isStreaming = false, saveToHistory = true) {
+    addMessage(type, content, isStreaming = false, saveToHistory = true, imageDataUrl = null) {
         // 检查是否是第一条消息，如果是则移除居中样式
         const isFirstMessage = this.chatMessages && this.chatMessages.querySelectorAll('.message').length === 0;
-        
+
         // 保存消息到当前对话历史（如果不是流式消息且需要保存）
         if (!isStreaming && saveToHistory && content) {
             this.currentChatHistory.push({
                 type: type,
                 content: content,
+                imageData: imageDataUrl || null, // 多模态：用户消息附图（仅本地历史展示用）
                 timestamp: new Date().toISOString()
             });
         }
-        
+
         const messageDiv = document.createElement('div');
         messageDiv.className = `message ${type}${isStreaming ? ' streaming' : ''}`;
 
@@ -910,9 +1044,18 @@ class SuperBizAgentApp {
         const messageContentWrapper = document.createElement('div');
         messageContentWrapper.className = 'message-content-wrapper';
 
+        // 用户消息带图：先插入缩略图
+        if (type === 'user' && imageDataUrl) {
+            const img = document.createElement('img');
+            img.src = imageDataUrl;
+            img.className = 'message-image';
+            img.alt = '用户发送的图片';
+            messageContentWrapper.appendChild(img);
+        }
+
         const messageContent = document.createElement('div');
         messageContent.className = 'message-content';
-        
+
         // 如果是assistant消息且不是流式消息，使用Markdown渲染
         if (type === 'assistant' && !isStreaming) {
             messageContent.innerHTML = this.renderMarkdown(content);
@@ -1084,6 +1227,91 @@ class SuperBizAgentApp {
                 }
             }, 300);
         }, 3000);
+    }
+
+    // ===== 图片发送（多模态） =====
+
+    // 处理图片选择：校验类型大小 → canvas 压缩 → 存入 pendingImage → 显示预览
+    handleImageSelect(event) {
+        const file = event.target.files[0];
+        if (this.imageInput) {
+            this.imageInput.value = ''; // 允许连续选择同一张图
+        }
+        if (!file) return;
+
+        if (!/^image\/(png|jpe?g|webp)$/.test(file.type)) {
+            this.showNotification('只支持 PNG / JPG / WebP 格式的图片', 'error');
+            return;
+        }
+        if (file.size > 10 * 1024 * 1024) {
+            this.showNotification('图片大小不能超过 10MB', 'error');
+            return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = (e) => this.compressImage(e.target.result);
+        reader.onerror = () => this.showNotification('图片读取失败', 'error');
+        reader.readAsDataURL(file);
+    }
+
+    // canvas 压缩：最长边 1024px + JPEG 0.85，控制 base64 体积
+    compressImage(dataUrl) {
+        const img = new Image();
+        img.onload = () => {
+            try {
+                const MAX_SIDE = 1024;
+                let { width, height } = img;
+                if (width > MAX_SIDE || height > MAX_SIDE) {
+                    const scale = MAX_SIDE / Math.max(width, height);
+                    width = Math.round(width * scale);
+                    height = Math.round(height * scale);
+                }
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+                const compressed = canvas.toDataURL('image/jpeg', 0.85);
+
+                this.pendingImage = compressed;
+                this.renderImagePreview();
+                this.showNotification('图片已添加，输入问题后发送', 'success');
+            } catch (err) {
+                console.error('图片压缩失败:', err);
+                this.showNotification('图片处理失败: ' + err.message, 'error');
+            }
+        };
+        img.onerror = () => this.showNotification('图片加载失败', 'error');
+        img.src = dataUrl;
+    }
+
+    // 输入框上方显示图片预览条（可移除）
+    renderImagePreview() {
+        if (!this.imagePreviewBar) {
+            // 预览条不存在则动态创建（挂在输入区上方）
+            const container = document.querySelector('.chat-input-container');
+            if (!container) return;
+            const bar = document.createElement('div');
+            bar.id = 'imagePreviewBar';
+            bar.className = 'image-preview-bar';
+            container.insertBefore(bar, container.firstChild);
+            this.imagePreviewBar = bar;
+        }
+
+        if (!this.pendingImage) {
+            this.imagePreviewBar.remove();
+            this.imagePreviewBar = null;
+            return;
+        }
+
+        this.imagePreviewBar.innerHTML = `
+            <img src="${this.pendingImage}" alt="待发送图片预览">
+            <button class="image-preview-remove" title="移除图片">&times;</button>
+        `;
+        const removeBtn = this.imagePreviewBar.querySelector('.image-preview-remove');
+        removeBtn.addEventListener('click', () => {
+            this.pendingImage = null;
+            this.renderImagePreview();
+        });
     }
 
     // 处理文件选择

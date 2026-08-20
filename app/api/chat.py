@@ -6,7 +6,7 @@
 import json
 from fastapi import APIRouter, HTTPException
 from sse_starlette.sse import EventSourceResponse
-from app.models.request import ChatRequest, ClearRequest
+from app.models.request import ChatRequest, ClearRequest, StopRequest
 from app.models.response import SessionInfoResponse, ApiResponse
 from app.agent.mcp_client import format_exception_chain
 from app.services.rag_agent_service import rag_agent_service
@@ -38,7 +38,8 @@ async def chat(request: ChatRequest):
         logger.info(f"[会话 {request.id}] 收到快速对话请求: {request.question}")
         answer = await rag_agent_service.query(
             request.question,
-            session_id=request.id
+            session_id=request.id,
+            image_data_url=request.image,
         )
 
         logger.info(f"[会话 {request.id}] 快速对话完成")
@@ -94,7 +95,11 @@ async def chat_stream(request: ChatRequest):
 
     async def event_generator():
         try:
-            async for chunk in rag_agent_service.query_stream(request.question, session_id=request.id):
+            async for chunk in rag_agent_service.query_stream(
+                request.question,
+                session_id=request.id,
+                image_data_url=request.image,
+            ):
                 chunk_type = chunk.get("type", "unknown")
                 chunk_data = chunk.get("data", None)
 
@@ -136,6 +141,15 @@ async def chat_stream(request: ChatRequest):
                             "data": chunk_data
                         }, ensure_ascii=False)
                     }
+                elif chunk_type == "stopped":
+                    # 用户主动终止：通知前端流已停止
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "stopped",
+                            "data": None
+                        }, ensure_ascii=False)
+                    }
                 elif chunk_type == "complete":
                     # 发送完成信号
                     yield {
@@ -168,6 +182,35 @@ async def chat_stream(request: ChatRequest):
             }
 
     return EventSourceResponse(event_generator())
+
+
+@router.post("/chat/stop")
+async def stop_chat(request: StopRequest):
+    """终止指定会话的流式输出
+
+    设置服务端停止标记，流式生成器在下一个 token 边界中断输出。
+
+    Args:
+        request: 终止请求（含会话 ID）
+
+    Returns:
+        统一格式的操作结果
+    """
+    try:
+        stopped = rag_agent_service.request_stop(request.session_id)
+        logger.info(f"终止流式输出请求: {request.session_id}, 已找到运行中任务: {stopped}")
+
+        return {
+            "code": 200,
+            "message": "success",
+            "data": {
+                "stopped": stopped
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"终止流式输出错误: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/chat/clear", response_model=ApiResponse)

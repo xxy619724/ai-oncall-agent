@@ -35,13 +35,22 @@ class Settings(BaseSettings):
     milvus_port: int = 19530
     milvus_timeout: int = 10000  # 毫秒
 
+    # Milvus 标量过滤配置（expr 表达式）
+    milvus_expr_filter_enabled: bool = True  # 总开关：False 时所有搜索不带 expr 降级到无过滤
+    milvus_default_status_filter: str = "active"  # RAG 检索默认只召回 status=active 的经验
+
     # RAG 配置
     rag_top_k: int = 10  # 召回阶段检索数量（供重排筛选）
     rag_model: str = "qwen-max"  # 使用快速响应模型，不带扩展思考
 
+    # 聊天链路多模态配置（Qwen-VL 视觉模型，支持图片理解）
+    chat_model: str = "qwen-vl-max"  # 聊天主模型（多模态，纯文本请求也兼容）
+    chat_image_max_base64_size: int = 4 * 1024 * 1024  # 单图 base64 字符串长度上限（约 3MB 原图）
+
     # 重排（Rerank）配置
     rag_rerank_top_k: int = 3  # 重排后保留的文档数
     rag_rerank_model: str = "qwen3-rerank"  # 百炼 rerank 模型
+    rag_relevance_score_threshold: float = 0.3  # rerank 分数阈值，低于此值过滤低质量文档
 
     # 上下文压缩配置
     rag_context_window_size: int = 131072  # qwen-max 上下文窗口（128K tokens）
@@ -52,6 +61,20 @@ class Settings(BaseSettings):
     # 文档分块配置
     chunk_max_size: int = 800
     chunk_overlap: int = 100
+
+    # OCR 扫描件配置（P1：qwen-vl 云端 OCR）
+    ocr_enabled: bool = True                  # 总开关：False 时扫描页直接跳过（等同旧行为）
+    ocr_model: str = "qwen-vl-max"            # OCR 用的多模态模型
+    ocr_timeout: float = 60.0                 # OCR 单页请求超时（秒）
+    ocr_min_text_chars: int = 50              # 单页有效字符低于此值判定为扫描页
+
+    # PDF 表格提取配置（P1：pdfplumber 独立分片）
+    pdf_table_extraction_enabled: bool = True  # 总开关：False 时不提取表格（等同旧行为）
+
+    # 语义缓存配置（P1：完整回答级缓存）
+    semantic_cache_enabled: bool = True        # 总开关：False 时完全旁路缓存
+    semantic_cache_threshold: float = 0.95     # 命中相似度阈值（COSINE，越高越保守）
+    semantic_cache_ttl_hours: int = 24         # 缓存 TTL（小时），过期自动失效
 
     # MCP 服务配置（transport: stdio | sse | streamable-http）
     # 腾讯云托管 MCP 的 URL 通常含 /sse/，需使用 sse；本地 FastMCP 使用 streamable-http
@@ -78,6 +101,10 @@ class Settings(BaseSettings):
     memory_dedup_threshold: float = 0.95     # 查重阈值（相似度≥此值判定重复，跳过写入）
     memory_conflict_threshold: float = 0.80  # 冲突检测阈值（相似度≥此值进入冲突检测）
     memory_default_ttl_days: int = 90        # 经验默认 TTL（天，超时后可软删除）
+
+    # 经验记忆 TTL 定时清理配置
+    memory_ttl_cleanup_interval_hours: int = 24   # TTL 检查间隔（小时）
+    memory_ttl_cleanup_batch_size: int = 100      # 每批标记 deprecated 数量（避免锁库）
 
     # 可观测体系配置（Trace/Span/Metric）
     observability_enabled: bool = True            # 总开关：False 时所有埋点零开销直通

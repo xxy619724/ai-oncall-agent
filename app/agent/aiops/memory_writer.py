@@ -148,6 +148,8 @@ async def _check_duplicate(
 
         # 用 similarity_search_with_score 获取相似度分数
         # Milvus COSINE 的 score 范围是 [0, 1]，越接近 1 越相似
+        # 查重场景故意不传 expr 过滤：需要看全部经验（含 deprecated），
+        # 避免重复写入已废弃的方案（RAG 检索才需要过滤 deprecated）
         docs_with_scores = vector_store_manager.vector_store.similarity_search_with_score(
             input_text, k=3, param={"metric_type": "COSINE", "params": {"nprobe": 10}}
         )
