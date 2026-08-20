@@ -20,7 +20,7 @@ from loguru import logger
 from app.config import config
 from app.observability.metrics import metrics_collector
 from app.observability.store import observability_store
-from app.observability.trace import current_trace, _state_to_summary
+from app.observability.trace import current_trace, schedule_write, _state_to_summary
 
 
 def _extract_token_usage(result: Any) -> int:
@@ -103,10 +103,11 @@ def trace_node(node_name: str):
                     "metadata": span_metadata,
                 }
 
-                # 异步持久化（不阻塞主流程）
-                import asyncio
-                asyncio.ensure_future(observability_store.save_span(span_data))
-                asyncio.ensure_future(
+                # 异步持久化（旁路落库，不阻塞主流程）
+                # 用 schedule_write 而非裸 ensure_future：后者不持强引用，
+                # 协程可能在执行前被 GC，且内部异常无人接收
+                schedule_write(observability_store.save_span(span_data))
+                schedule_write(
                     metrics_collector.record_node_completion(
                         node_name=node_name,
                         duration_ms=duration_ms,

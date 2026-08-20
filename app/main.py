@@ -71,6 +71,13 @@ async def lifespan(app: FastAPI):
     from app.services.rag_agent_service import rag_agent_service
     await rag_agent_service.cleanup()
 
+    # 关闭 AIOps 工作流的 SQLite 连接（checkpoint + 经验表）
+    from app.services.aiops_service import aiops_service
+    await aiops_service.cleanup()
+
+    # 关闭可观测数据存储连接（须在最后，前面的清理仍可能产生埋点）
+    await observability_store.cleanup()
+
     # 关闭 Milvus
     milvus_manager.close()
     logger.info(f"👋 {config.app_name} 关闭")
@@ -85,13 +92,21 @@ app = FastAPI(
 )
 
 # 配置 CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 生产环境应该限制具体域名
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 内置前端由本服务同源提供（/static），同源请求不经过 CORS，因此默认空白名单即可。
+# 需要跨域访问时通过 CORS_ALLOW_ORIGINS 显式列出来源，不使用 "*"：
+# "*" 与 allow_credentials=True 的组合会被浏览器拒绝，且等同于对任意站点开放接口。
+_cors_origins = config.cors_origins_list
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
+    logger.info(f"CORS 已启用，允许来源: {_cors_origins}")
+else:
+    logger.info("CORS 未配置任何来源（仅同源访问）")
 
 # 注册路由
 app.include_router(health.router, tags=["健康检查"])

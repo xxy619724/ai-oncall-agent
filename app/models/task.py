@@ -25,6 +25,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from loguru import logger
+
 
 class TaskStatus(str, Enum):
     """任务状态枚举（6 种状态）"""
@@ -56,13 +58,44 @@ class TaskPriority(Enum):
     LOW = 2
 
     @classmethod
-    def from_str(cls, value: str | None) -> "TaskPriority":
-        """从字符串解析优先级（不区分大小写，默认 NORMAL）"""
+    def from_str(cls, value: object) -> "TaskPriority":
+        """从字符串解析优先级（不区分大小写，无法识别时返回 NORMAL）
+
+        对任意类型的入参都返回合法枚举，不抛异常：该方法同时处理 API 传入的
+        优先级字符串和数据库读出的值，任何一处的脏数据都不应让请求 500。
+
+        但"不抛异常"不等于"不留痕迹"：下面三个回退分支都会打 WARNING，
+        否则脏数据会被静默改写成 NORMAL，出问题时无从追查是哪一层传坏了值。
+        value is None 是合法默认路径（API 未指定优先级），不记日志。
+        """
         if value is None:
             return cls.NORMAL
+        # 已经是枚举则直接返回
+        if isinstance(value, cls):
+            return value
+        # 数字形式（数据库里存过 0/1/2，或 API 传了整数）
+        if isinstance(value, int) and not isinstance(value, bool):
+            try:
+                return cls(value)
+            except ValueError:
+                logger.warning(
+                    f"优先级数值越界，回退为 NORMAL: {value!r}"
+                    f"（合法值 {[m.value for m in cls]}）"
+                )
+                return cls.NORMAL
+        if not isinstance(value, str):
+            logger.warning(
+                f"优先级类型非法，回退为 NORMAL: {value!r} "
+                f"(type={type(value).__name__})"
+            )
+            return cls.NORMAL
         try:
-            return cls[value.upper()]
+            return cls[value.strip().upper()]
         except KeyError:
+            logger.warning(
+                f"优先级名称无法识别，回退为 NORMAL: {value!r}"
+                f"（合法值 {[m.name.lower() for m in cls]}）"
+            )
             return cls.NORMAL
 
 

@@ -10,6 +10,7 @@
 因此子任务能读到 trace_id，但修改不会影响父任务（符合预期）。
 """
 
+import asyncio
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -26,6 +27,38 @@ from app.observability.store import observability_store
 _current_trace: ContextVar[Optional["TraceContext"]] = ContextVar(
     "_current_trace", default=None
 )
+
+# 后台落库协程的强引用集合。
+# asyncio 只对 Task 持弱引用，不留强引用的话协程可能在真正执行前就被 GC 回收，
+# 埋点会静默丢失；且丢弃返回值时协程内的异常也无人接收。
+_pending_writes: set = set()
+
+
+def schedule_write(coro) -> None:
+    """把落库协程投递到事件循环，持强引用并记录异常
+
+    埋点属于旁路能力：无运行中的事件循环时（同步上下文、单元测试）直接放弃，
+    不能因为写不了观测数据而影响主流程。
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 没有运行中的事件循环：关闭协程避免 "never awaited" 警告
+        coro.close()
+        return
+
+    task = loop.create_task(coro)
+    _pending_writes.add(task)
+
+    def _done(t: "asyncio.Task") -> None:
+        _pending_writes.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.warning(f"可观测数据落库失败: {type(exc).__name__}: {exc}")
+
+    task.add_done_callback(_done)
 
 
 @dataclass
@@ -136,9 +169,8 @@ class start_trace:
             return self._ctx
         # 设置 contextvar，保存 token 用于退出时恢复
         self._token = _current_trace.set(self._ctx)
-        # 异步保存 trace 记录到 SQLite（fire-and-forget，不阻塞）
-        import asyncio
-        asyncio.ensure_future(
+        # 异步保存 trace 记录到 SQLite（旁路落库，不阻塞主流程）
+        schedule_write(
             observability_store.save_trace(
                 self.trace_id, self.session_id, self.input_text, self.started_at
             )
@@ -161,8 +193,7 @@ class start_trace:
         status = "completed" if exc_type is None else "failed"
         error_msg = f"{exc_type.__name__}: {exc_val}" if exc_val else ""
 
-        import asyncio
-        asyncio.ensure_future(
+        schedule_write(
             observability_store.update_trace_status(
                 trace_id=self.trace_id,
                 status=status,

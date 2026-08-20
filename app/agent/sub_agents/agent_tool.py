@@ -32,7 +32,6 @@
 - contextvars 在 async 链路中自动传播，子 Agent 调用能读到 planner/executor 设置的 trace_id
 """
 
-import asyncio
 import json
 import uuid
 from datetime import datetime
@@ -41,7 +40,12 @@ from langchain_core.tools import tool
 from loguru import logger
 
 from app.config import config
-from app.observability import current_trace, metrics_collector, observability_store
+from app.observability import (
+    current_trace,
+    metrics_collector,
+    observability_store,
+    schedule_write,
+)
 from .registry import AgentRegistry
 
 
@@ -195,11 +199,13 @@ async def _finalize_span(
         "metadata": span_metadata,
     }
 
-    # 异步保存 span（fire-and-forget）
-    asyncio.ensure_future(observability_store.save_span(span_data))
+    # 异步保存 span（旁路落库）
+    # 用 schedule_write 而非裸 ensure_future：后者不持强引用，
+    # 协程可能在执行前被 GC，且内部异常无人接收
+    schedule_write(observability_store.save_span(span_data))
 
     # 异步记录节点指标（累计到 trace 上下文）
-    asyncio.ensure_future(
+    schedule_write(
         metrics_collector.record_node_completion(
             node_name=subagent_type,
             duration_ms=duration_ms,

@@ -11,6 +11,7 @@ from app.observability.trace import (
     TraceContext,
     Span,
     current_trace,
+    schedule_write,
     start_trace,
 )
 from app.observability.metrics import metrics_collector, MetricsCollector
@@ -22,6 +23,7 @@ __all__ = [
     "TraceContext",
     "Span",
     "current_trace",
+    "schedule_write",
     "start_trace",
     "metrics_collector",
     "MetricsCollector",

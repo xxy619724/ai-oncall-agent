@@ -1,3 +1,44 @@
+// ===== HTML 清洗白名单 =====
+// 渲染的内容来自 LLM 输出、RAG 检索片段和 MCP 工具返回，均不可信；
+// marked v11 已移除内置 sanitize 选项，因此渲染结果必须先经 sanitizeHtml() 清洗。
+// 白名单之外的标签一律剥离（保留其文字内容），属性一律丢弃。
+
+// 允许保留的标签：Markdown 渲染产物 + 代码高亮所需的 span
+const ALLOWED_TAGS = new Set([
+    'P', 'BR', 'HR', 'SPAN', 'DIV',
+    'STRONG', 'B', 'EM', 'I', 'U', 'DEL', 'S', 'MARK', 'SMALL', 'SUP', 'SUB',
+    'CODE', 'PRE', 'KBD', 'SAMP', 'VAR',
+    'BLOCKQUOTE', 'UL', 'OL', 'LI', 'DL', 'DT', 'DD',
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+    'A', 'IMG',
+    'TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TH', 'TD', 'CAPTION',
+]);
+
+// 每个标签允许保留的属性（未列出的标签 = 不允许任何属性）
+const ALLOWED_ATTRS = {
+    A: new Set(['href', 'title', 'target', 'rel']),
+    IMG: new Set(['src', 'alt', 'title', 'width', 'height']),
+    SPAN: new Set(['class']),      // hljs 代码高亮
+    CODE: new Set(['class']),      // language-xxx
+    PRE: new Set(['class']),
+    DIV: new Set(['class']),
+    TH: new Set(['align', 'colspan', 'rowspan']),
+    TD: new Set(['align', 'colspan', 'rowspan']),
+    OL: new Set(['start']),
+};
+
+// 整棵子树都要删除的标签（不保留文字内容）——脚本载体
+const DROP_SUBTREE_TAGS = new Set([
+    'SCRIPT', 'IFRAME', 'OBJECT', 'EMBED', 'APPLET', 'STYLE', 'LINK', 'META',
+    'BASE', 'FORM', 'INPUT', 'BUTTON', 'TEXTAREA', 'SELECT', 'OPTION',
+    'NOSCRIPT', 'TEMPLATE', 'SVG', 'MATH', 'AUDIO', 'VIDEO', 'SOURCE', 'TRACK',
+]);
+
+// href 允许的协议
+const SAFE_URL_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:', 'ftp:']);
+// img src 额外允许的内联图片类型
+const SAFE_DATA_IMAGE = /^data:image\/(png|jpe?g|gif|webp|bmp|x-icon);base64,[a-z0-9+/=\s]*$/i;
+
 // SuperBizAgent 前端应用
 class SuperBizAgentApp {
     constructor() {
@@ -61,22 +102,143 @@ class SuperBizAgentApp {
         checkMarked();
     }
 
-    // 安全地渲染 Markdown
+    // 安全地渲染 Markdown（渲染结果必经 sanitizeHtml 清洗后才可写入 innerHTML）
     renderMarkdown(content) {
         if (!content) return '';
-        
+
         // 检查 marked 是否可用
         if (typeof marked === 'undefined') {
             console.warn('marked 库未加载，使用纯文本显示');
             return this.escapeHtml(content);
         }
-        
+
         try {
             const html = marked.parse(content);
-            return html;
+            // 失败关闭（fail closed）：清洗环节出任何问题都退回纯文本转义，
+            // 绝不把未清洗的 HTML 交给调用方写入 innerHTML
+            return this.sanitizeHtml(html);
         } catch (e) {
             console.error('Markdown 渲染失败:', e);
             return this.escapeHtml(content);
+        }
+    }
+
+    // 清洗 HTML：按白名单剥离标签与属性，阻断脚本执行路径
+    // 用 DOMParser 解析到独立文档中处理——该文档不会被渲染，
+    // 其中的 <script> 不执行、<img onerror> 也不触发。
+    sanitizeHtml(html) {
+        if (!html) return '';
+
+        // 环境不支持 DOMParser 时退回纯文本，不做冒险渲染
+        if (typeof DOMParser === 'undefined') {
+            console.warn('DOMParser 不可用，降级为纯文本');
+            return this.escapeHtml(html);
+        }
+
+        try {
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            if (!doc || !doc.body) return this.escapeHtml(html);
+
+            this.scrubNode(doc.body);
+            return doc.body.innerHTML;
+        } catch (e) {
+            console.error('HTML 清洗失败，降级为纯文本:', e);
+            return this.escapeHtml(html);
+        }
+    }
+
+    // 递归清洗单个节点的子元素
+    scrubNode(root) {
+        // 复制成数组：下面会在遍历过程中改动 childNodes
+        const children = Array.from(root.childNodes);
+
+        for (const node of children) {
+            // 文本节点安全，保留
+            if (node.nodeType === Node.TEXT_NODE) continue;
+
+            // 注释节点删除（可能藏条件注释）
+            if (node.nodeType === Node.COMMENT_NODE) {
+                node.remove();
+                continue;
+            }
+
+            if (node.nodeType !== Node.ELEMENT_NODE) {
+                node.remove();
+                continue;
+            }
+
+            const tag = node.tagName.toUpperCase();
+
+            // 脚本载体：整棵子树删除，不保留内容
+            if (DROP_SUBTREE_TAGS.has(tag)) {
+                node.remove();
+                continue;
+            }
+
+            // 白名单外的标签：剥离标签本身，但把子节点提上来保留文字
+            if (!ALLOWED_TAGS.has(tag)) {
+                this.scrubNode(node);
+                while (node.firstChild) {
+                    root.insertBefore(node.firstChild, node);
+                }
+                node.remove();
+                continue;
+            }
+
+            this.scrubAttributes(node, tag);
+            this.scrubNode(node);
+        }
+    }
+
+    // 按白名单清洗单个元素的属性
+    scrubAttributes(node, tag) {
+        const allowed = ALLOWED_ATTRS[tag] || new Set();
+
+        // 逆序遍历：removeAttribute 会改动 attributes 集合
+        for (let i = node.attributes.length - 1; i >= 0; i--) {
+            const attr = node.attributes[i];
+            const name = attr.name.toLowerCase();
+
+            // on* 事件处理器一律删除（onerror / onload / onclick ...）
+            if (name.startsWith('on') || !allowed.has(name)) {
+                node.removeAttribute(attr.name);
+                continue;
+            }
+
+            // URL 类属性校验协议，阻断 javascript: / vbscript: / data:text/html
+            if (name === 'href' || name === 'src') {
+                if (!this.isSafeUrl(attr.value, tag)) {
+                    node.removeAttribute(attr.name);
+                }
+            }
+        }
+
+        // 外链统一加 noopener，避免 target=_blank 的反向窗口引用
+        if (tag === 'A' && node.getAttribute('target')) {
+            node.setAttribute('rel', 'noopener noreferrer');
+        }
+    }
+
+    // 校验 URL 协议是否安全
+    isSafeUrl(value, tag) {
+        // 去掉首尾空白与内嵌控制字符（\x00-\x1F 可用于绕过前缀匹配，
+        // 例如 "java\tscript:alert(1)" 在部分浏览器中仍会执行）
+        const raw = String(value).replace(/[\x00-\x1F\x7F]/g, '').trim();
+        if (!raw) return false;
+
+        // 内联图片单独放行（图片预览、多模态回显需要）
+        if (tag === 'IMG' && SAFE_DATA_IMAGE.test(raw)) return true;
+
+        // 相对路径 / 页内锚点：无协议，安全
+        if (/^[#/?]/.test(raw)) return true;
+
+        try {
+            // 以当前页为 base 解析，相对路径会继承 http(s)
+            const url = new URL(raw, window.location.origin);
+            return SAFE_URL_SCHEMES.has(url.protocol);
+        } catch (e) {
+            // 解析不出来的一律拒绝
+            return false;
         }
     }
 

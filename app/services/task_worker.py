@@ -16,7 +16,6 @@
 """
 
 import asyncio
-from datetime import datetime
 from typing import Any, Optional
 
 from loguru import logger
@@ -24,6 +23,10 @@ from loguru import logger
 from app.config import config
 from app.models.task import TaskStatus
 from app.services.task_service import TaskService, get_task_service
+
+
+# 终止事件类型：出现其一即代表任务已结束，SSE 可以关闭
+TERMINAL_EVENT_TYPES = ("complete", "error", "cancelled")
 
 
 class EventStore:
@@ -38,18 +41,41 @@ class EventStore:
         self._max_size = max_size_per_task
         # 新事件通知：task_id → asyncio.Event，SSE 端点等待
         self._notifiers: dict[str, asyncio.Event] = {}
+        # 已丢弃事件计数（缓冲区满时），用于给客户端一个明确提示
+        self._dropped: dict[str, int] = {}
 
     def append(self, task_id: str, event: dict[str, Any]) -> None:
-        """追加事件"""
+        """追加事件
+
+        缓冲区满时丢弃中间事件，但终止事件（complete/error/cancelled）必须留下：
+        SSE 端点靠它判断流是否结束，一旦丢掉就会无限发心跳直到客户端断开。
+        """
         if task_id not in self._events:
             self._events[task_id] = []
         events = self._events[task_id]
+
+        is_terminal = event.get("type") in TERMINAL_EVENT_TYPES
+
         if len(events) < self._max_size:
             events.append(event)
+        elif is_terminal:
+            # 腾一个位置给终止事件：挤掉最老的中间事件
+            # （首个事件通常是状态说明，丢中间的对客户端影响最小）
+            drop_at = len(events) // 2
+            events.pop(drop_at)
+            self._dropped[task_id] = self._dropped.get(task_id, 0) + 1
+            events.append(event)
+        else:
+            self._dropped[task_id] = self._dropped.get(task_id, 0) + 1
+
         # 通知等待的 SSE 消费者
         notifier = self._notifiers.get(task_id)
         if notifier is not None:
             notifier.set()
+
+    def dropped_count(self, task_id: str) -> int:
+        """返回因缓冲区满而丢弃的事件数（0 表示无丢弃）"""
+        return self._dropped.get(task_id, 0)
 
     def get_events(
         self, task_id: str, after_index: int = 0
@@ -65,17 +91,22 @@ class EventStore:
         return self._notifiers[task_id]
 
     def is_complete(self, task_id: str) -> bool:
-        """任务是否已结束（最后一个事件是 complete/error）"""
+        """任务是否已结束（最后一个事件是 complete/error/cancelled）"""
         events = self._events.get(task_id, [])
         if not events:
             return False
         last = events[-1]
-        return last.get("type") in ("complete", "error", "cancelled")
+        return last.get("type") in TERMINAL_EVENT_TYPES
 
     def cleanup(self, task_id: str) -> None:
         """清理任务事件（任务结束后延迟调用）"""
         self._events.pop(task_id, None)
         self._notifiers.pop(task_id, None)
+        self._dropped.pop(task_id, None)
+
+    def task_count(self) -> int:
+        """当前驻留内存的任务数（用于观察是否泄漏）"""
+        return len(self._events)
 
 
 # 全局 EventStore 单例
@@ -96,6 +127,9 @@ class TaskWorker:
         self.task_service = task_service
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        # 延迟清理协程的强引用集合：asyncio 只持弱引用，不留强引用的话
+        # 任务可能在执行前被 GC 回收，清理就静默不发生了
+        self._cleanup_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         """启动 Worker 后台协程"""
@@ -119,6 +153,15 @@ class TaskWorker:
         except asyncio.CancelledError:
             pass
         self._task = None
+
+        # 取消仍在等待的延迟清理协程（其 CancelledError 分支会立即完成清理）
+        pending = list(self._cleanup_tasks)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._cleanup_tasks.clear()
+
         logger.info("TaskWorker 已停止")
 
     async def _run_loop(self) -> None:
@@ -149,10 +192,48 @@ class TaskWorker:
                     await self.task_service.transition_to_failed(
                         task_id, f"Worker 异常: {e}"
                     )
-                except Exception:
-                    pass
+                except Exception as inner:
+                    # 状态已是终态等情形下流转会失败，此处仅记录，不再往上抛
+                    logger.warning(
+                        f"[Task {task_id[:8]}] 兜底标记 failed 未成功: {inner}"
+                    )
             finally:
                 self.task_service.queue.task_done()
+                # 无论成功/失败/取消，都要释放该任务占用的内存
+                self._schedule_cleanup(task_id)
+
+    def _schedule_cleanup(self, task_id: str) -> None:
+        """延迟清理任务的事件缓冲与取消信号
+
+        延迟而非立即清理：SSE 端点可能仍在读取事件，立即清空会让消费者
+        拿不到终止事件。保留 task_event_retention_seconds 后释放。
+        """
+
+        async def _delayed() -> None:
+            try:
+                await asyncio.sleep(config.task_event_retention_seconds)
+                dropped = event_store.dropped_count(task_id)
+                if dropped:
+                    logger.warning(
+                        f"[Task {task_id[:8]}] 事件缓冲区溢出，丢弃 {dropped} 条中间事件"
+                        f"（上限 {config.task_event_buffer_size}）"
+                    )
+                event_store.cleanup(task_id)
+                self.task_service.cleanup_cancel_event(task_id)
+                logger.debug(
+                    f"[Task {task_id[:8]}] 事件缓冲已释放"
+                    f"（内存驻留任务数={event_store.task_count()}）"
+                )
+            except asyncio.CancelledError:
+                # 关服时取消：立即清理，不再等待
+                event_store.cleanup(task_id)
+                self.task_service.cleanup_cancel_event(task_id)
+                raise
+
+        t = asyncio.create_task(_delayed())
+        # 持强引用，并在完成后移除，避免集合本身变成泄漏点
+        self._cleanup_tasks.add(t)
+        t.add_done_callback(self._cleanup_tasks.discard)
 
     async def _execute_task(self, task_id: str) -> None:
         """执行单个任务
@@ -165,6 +246,27 @@ class TaskWorker:
         5. 检测取消信号 → CANCELLED
         6. 执行完成 → SUCCEEDED / FAILED
         """
+        # 排队期间被取消的任务仍留在队列里，会被 Worker 正常拉到。
+        # 此时状态已是 CANCELLED（终态），直接跳过，否则下面的
+        # transition_to_running 会抛 TransitionError 刷出误导性错误日志。
+        existing = await self.task_service.get(task_id)
+        if existing is None:
+            logger.error(f"[Task {task_id[:8]}] 任务不存在，跳过")
+            return
+        if TaskStatus.is_terminal(existing.status):
+            logger.info(
+                f"[Task {task_id[:8]}] 拉取到已处于终态的任务"
+                f"（{existing.status.value}），跳过执行"
+            )
+            # 补一条终止事件，让已连上的 SSE 消费者能正常收尾
+            if not event_store.is_complete(task_id):
+                event_store.append(task_id, {
+                    "type": existing.status.value,
+                    "stage": "skipped",
+                    "message": f"任务在排队期间已{existing.status.value}",
+                })
+            return
+
         # 注册取消信号
         cancel_event = self.task_service.register_cancel_event(task_id)
 

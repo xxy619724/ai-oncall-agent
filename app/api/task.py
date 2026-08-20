@@ -224,6 +224,13 @@ async def stream_task_events(task_id: str):
                 consumed_index = 0
 
                 while True:
+                    # 必须先 clear 再读：若放到读之后，Worker 在
+                    # 「读完」与「clear」之间 append 的那次通知会被抹掉，
+                    # 导致本轮 wait() 空等满超时才恢复。
+                    # 先 clear 的话，这期间的 append 会重新 set，
+                    # 最坏情况只是多空转一轮，不会丢通知。
+                    notifier.clear()
+
                     # 读取新事件
                     new_events = event_store.get_events(
                         task_id, after_index=consumed_index
@@ -239,9 +246,29 @@ async def stream_task_events(task_id: str):
                     if event_store.is_complete(task_id):
                         break
 
+                    # 兜底：任务已进终态但终止事件缺失（如事件缓冲被清理），
+                    # 直接补一条 final 事件收尾，避免这里无限发心跳不退出
+                    latest = await service.get(task_id)
+                    if latest is not None and TaskStatus.is_terminal(latest.status):
+                        yield {
+                            "event": "message",
+                            "data": json.dumps({
+                                "type": (
+                                    "complete"
+                                    if latest.status == TaskStatus.SUCCEEDED
+                                    else latest.status.value
+                                ),
+                                "stage": "final",
+                                "status": latest.status.value,
+                                "message": "任务已结束",
+                                "result": latest.result_text,
+                                "error": latest.error_message,
+                            }, ensure_ascii=False),
+                        }
+                        break
+
                     # 等待新事件（带超时，避免长时间阻塞）
                     try:
-                        notifier.clear()
                         await asyncio.wait_for(notifier.wait(), timeout=30.0)
                     except asyncio.TimeoutError:
                         # 推送心跳保活

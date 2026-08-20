@@ -130,9 +130,10 @@ class TaskStore:
                 "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
             ) as cur:
                 row = await cur.fetchone()
+                columns = [c[0] for c in cur.description]
             if not row:
                 return None
-            return self._row_to_task(row)
+            return self._row_to_task(row, columns)
         except Exception as e:
             logger.error(f"TaskStore.get 失败 (task_id={task_id}): {e}")
             return None
@@ -147,7 +148,8 @@ class TaskStore:
                 "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
             ) as cur:
                 rows = await cur.fetchall()
-            return [self._row_to_task(r) for r in rows]
+                columns = [c[0] for c in cur.description]
+            return [self._row_to_task(r, columns) for r in rows]
         except Exception as e:
             logger.error(f"TaskStore.list 失败: {e}")
             return []
@@ -163,7 +165,8 @@ class TaskStore:
                 (status.value,),
             ) as cur:
                 rows = await cur.fetchall()
-            return [self._row_to_task(r) for r in rows]
+                columns = [c[0] for c in cur.description]
+            return [self._row_to_task(r, columns) for r in rows]
         except Exception as e:
             logger.error(f"TaskStore.list_by_status 失败: {e}")
             return []
@@ -181,22 +184,33 @@ class TaskStore:
                 self._initialized = False
 
     @staticmethod
-    def _row_to_task(row) -> Task:
-        """数据库行转换为 Task 对象"""
+    def _row_to_task(row, columns: list[str]) -> Task:
+        """数据库行转换为 Task 对象（按列名取值）
+
+        必须按列名而非固定下标取值：上面的兼容分支用 ALTER TABLE 补 priority 列，
+        而 SQLite 会把新列追加到表末尾而不是原定义位置。旧库迁移后列序为
+        (..., started_at, ended_at, priority)，按下标读会把 progress_completed
+        当成 priority，导致 TaskPriority.from_str(int) 抛 AttributeError 且后续字段全部错位。
+
+        Args:
+            row: 查询结果行
+            columns: 与 row 对应的列名（取自 cursor.description）
+        """
+        d = dict(zip(columns, row))
         return Task(
-            task_id=row[0],
-            session_id=row[1],
-            input_text=row[2],
-            status=TaskStatus(row[3]),
-            priority=TaskPriority.from_str(row[4] if len(row) > 4 else "normal"),
-            progress_completed=row[5] if len(row) > 5 else (row[4] or 0),
-            progress_total=row[6] if len(row) > 6 else (row[5] or 0),
-            result_text=row[7] if len(row) > 7 else row[6],
-            error_message=row[8] if len(row) > 8 else row[7],
-            created_at=row[9] if len(row) > 9 else row[8],
-            updated_at=row[10] if len(row) > 10 else row[9],
-            started_at=row[11] if len(row) > 11 else row[10],
-            ended_at=row[12] if len(row) > 12 else row[11],
+            task_id=d["task_id"],
+            session_id=d["session_id"],
+            input_text=d["input_text"],
+            status=TaskStatus(d["status"]),
+            priority=TaskPriority.from_str(d.get("priority") or "normal"),
+            progress_completed=d.get("progress_completed") or 0,
+            progress_total=d.get("progress_total") or 0,
+            result_text=d.get("result_text"),
+            error_message=d.get("error_message"),
+            created_at=d["created_at"],
+            updated_at=d["updated_at"],
+            started_at=d.get("started_at"),
+            ended_at=d.get("ended_at"),
         )
 
 

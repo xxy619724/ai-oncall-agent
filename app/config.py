@@ -3,7 +3,7 @@
 使用 Pydantic Settings 实现类型安全的配置管理
 """
 
-from typing import Dict, Any
+from typing import Any, Dict, List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     debug: bool = False
     host: str = "0.0.0.0"
     port: int = 9900
+
+    # CORS 配置
+    # 逗号分隔的来源白名单。留空 = 不放行任何跨域来源（内置前端与后端同源，无需 CORS）。
+    # 注意：通配符 "*" 与 allow_credentials=True 组合会被浏览器拒绝，故此处不支持 "*" + 凭证。
+    cors_allow_origins: str = ""
+
+    # /api/index_directory 目录白名单（逗号分隔，相对项目根目录）
+    # 该端点会把目录下的文件读入向量库，必须限制范围，否则可被用于读取任意路径。
+    index_allowed_dirs: str = "uploads,aiops-docs"
 
     # DashScope 配置
     dashscope_api_key: str = ""  # 默认空字符串，实际使用需从环境变量加载
@@ -119,9 +128,22 @@ class Settings(BaseSettings):
     task_timeout_seconds: int = 300                # 任务执行硬超时（秒），超时标记 failed
     task_event_buffer_size: int = 200              # 单任务事件缓冲区大小（内存）
     task_worker_concurrency: int = 1               # Worker 并发数（阶段一固定为 1）
+    # 任务结束后事件在内存中的保留时长（秒）。留出这段时间给仍在读取的 SSE 消费者，
+    # 到期后清理，避免 event_store 随任务数无限增长。
+    task_event_retention_seconds: int = 300
 
     # LLM 并发控制（防止 API 限流 + httpx 连接池耗尽）
     llm_concurrency_limit: int = 3                 # 同时调用 LLM 的最大数量
+
+    @property
+    def cors_origins_list(self) -> List[str]:
+        """解析 CORS 白名单为列表（空配置返回空列表，即不放行跨域）"""
+        return [o.strip() for o in self.cors_allow_origins.split(",") if o.strip()]
+
+    @property
+    def index_allowed_dirs_list(self) -> List[str]:
+        """解析索引目录白名单为列表"""
+        return [d.strip() for d in self.index_allowed_dirs.split(",") if d.strip()]
 
     @property
     def mcp_servers(self) -> Dict[str, Dict[str, Any]]:
