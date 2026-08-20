@@ -15,6 +15,7 @@ import aiosqlite
 from loguru import logger
 
 from app.config import config
+from app.services.image_store_service import image_store_service
 
 
 class SqliteCheckpointCleaner:
@@ -111,6 +112,7 @@ class SqliteCheckpointCleaner:
             return 0
 
         cleaned = 0
+        images_removed = 0
         for thread_id in expired_threads:
             try:
                 # 2. 按顺序删除:writes → checkpoints → checkpoint_sessions
@@ -126,12 +128,24 @@ class SqliteCheckpointCleaner:
                     (thread_id,),
                 )
                 cleaned += 1
+
+                # 3. 同步删除该会话的外置图片
+                # 消息记录已删除，图片再无引用者，不删就会永久占盘
+                try:
+                    images_removed += await asyncio.to_thread(
+                        image_store_service.cleanup_session, thread_id
+                    )
+                except Exception as img_err:
+                    logger.warning(
+                        f"清理 thread_id={thread_id} 的图片失败: {img_err}"
+                    )
             except Exception as e:
                 logger.error(f"清理 thread_id={thread_id} 失败: {e}")
 
         await self.conn.commit()
         logger.info(
             f"清理完成: 共清理 {cleaned}/{len(expired_threads)} 个过期会话"
+            + (f", 同时删除 {images_removed} 张图片" if images_removed else "")
         )
         return cleaned
 

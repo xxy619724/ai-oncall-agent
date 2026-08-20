@@ -28,7 +28,17 @@ async def lifespan(app: FastAPI):
     logger.info(f"📝 环境: {'开发' if config.debug else '生产'}")
     logger.info(f"🌐 监听地址: http://{config.host}:{config.port}")
     logger.info(f"📚 API 文档: http://{config.host}:{config.port}/docs")
-    
+
+    # 全站无鉴权，绑到非本机地址等于把接口开放给同网段：
+    # /api/upload 可灌向量库、/api/chat 可耗尽 API 额度。显式告警而非静默放行。
+    if config.host not in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(
+            f"⚠️ 正在监听 {config.host}（非本机地址），而本服务尚未接入任何鉴权。"
+            f"同网段任何人都可调用 /api/upload、/api/index_directory、/api/chat。"
+            f"仅在已配置反向代理鉴权或可信网络内使用。"
+        )
+
+
     # 连接 Milvus
     logger.info("🔌 正在连接 Milvus...")
     milvus_manager.connect()

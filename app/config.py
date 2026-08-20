@@ -21,7 +21,10 @@ class Settings(BaseSettings):
     app_name: str = "SuperBizAgent"
     app_version: str = "1.0.0"
     debug: bool = False
-    host: str = "0.0.0.0"
+    # 默认只监听本机：本服务全站无鉴权，绑 0.0.0.0 等于把 /api/upload、
+    # /api/index_directory、/api/chat 暴露给同网段任何人（可灌向量库、可耗尽 API 额度）。
+    # 确需对外提供服务时再显式改为 0.0.0.0，并同时配置鉴权与 CORS_ALLOW_ORIGINS。
+    host: str = "127.0.0.1"
     port: int = 9900
 
     # CORS 配置
@@ -55,6 +58,13 @@ class Settings(BaseSettings):
     # 聊天链路多模态配置（Qwen-VL 视觉模型，支持图片理解）
     chat_model: str = "qwen-vl-max"  # 聊天主模型（多模态，纯文本请求也兼容）
     chat_image_max_base64_size: int = 4 * 1024 * 1024  # 单图 base64 字符串长度上限（约 3MB 原图）
+    # 图片外置存储：base64 落盘、消息里只留引用，避免 checkpoint 被图片撑大。
+    # False 时退回旧行为（base64 直接进消息与 checkpoint）。
+    chat_image_external_store: bool = True
+    # 有多少「含图消息」保留真图送给模型（其余降级为文字占位）。
+    # 默认 1 = 只有当前轮的图片真的送进视觉模型，避免 keep 窗口内的图片
+    # 每轮重复计费视觉 token。设为 0 则永不还原（纯文字模式）。
+    chat_image_keep_recent_rounds: int = 1
 
     # 重排（Rerank）配置
     rag_rerank_top_k: int = 3  # 重排后保留的文档数

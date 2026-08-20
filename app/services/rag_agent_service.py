@@ -19,6 +19,11 @@ from langchain_qwq import ChatQwen
 from app.config import config
 from app.tools import DEFAULT_LOCAL_AGENT_TOOLS
 from app.services.semantic_cache_service import semantic_cache_service
+from app.services.image_store_service import (
+    ImageValidationError,
+    image_store_service,
+)
+from app.agent.image_hydration import ImageHydrationMiddleware
 from app.agent.mcp_client import (
     get_mcp_client_with_retry,
     load_mcp_tools_safe,
@@ -137,12 +142,19 @@ class RagAgentService:
             keep=("messages", config.rag_keep_recent_rounds * 2),
         )
 
+        # 图片引用还原中间件：调模型前把 image_ref 换成真实 image_url。
+        # 必须排在压缩中间件之后（即更靠内层）：压缩看到的是轻量引用块，
+        # 不会把 base64 计入 token 预算；还原发生在最后一刻，不写回 state。
+        middleware = [summarization_middleware]
+        if config.chat_image_external_store:
+            middleware.append(ImageHydrationMiddleware())
+
         self.agent = create_agent(
             self.model,
             tools=all_tools,
             checkpointer=self.checkpointer,
             system_prompt=self.system_prompt,
-            middleware=[summarization_middleware],
+            middleware=middleware,
         )
 
         self._agent_initialized = True
@@ -186,31 +198,46 @@ class RagAgentService:
         """).strip()
 
     @staticmethod
-    def _build_message_content(question: str, image_data_url: str = "") -> Any:
+    def _build_message_content(
+        question: str, image_data_url: str = "", session_id: str = "default"
+    ) -> Any:
         """构建消息内容：无图时返回纯文本，带图时返回多模态 content 块列表
+
+        带图时默认走外置存储：图片落盘，消息里只留轻量引用块（image_ref），
+        真图由 ImageHydrationMiddleware 在调模型前还原。这样 base64 不会被
+        checkpoint 快照反复复制（实测一张 27KB 图曾放大成 114KB）。
 
         Args:
             question: 用户问题文本
             image_data_url: 可选图片，完整 dataURL（data:image/png;base64,...）
+            session_id: 会话 ID（决定图片存储目录，便于按会话清理）
 
         Returns:
             str 或 list: LangChain 消息 content（多模态时为 content 块列表）
+
+        Raises:
+            ImageValidationError: 图片超限 / 格式非法（ValueError 子类）
         """
         image_data_url = (image_data_url or "").strip()
-
-        # 图片大小校验：防止 base64 撑爆 checkpoint 和 API 请求
-        if image_data_url and len(image_data_url) > config.chat_image_max_base64_size:
-            raise ValueError(
-                f"图片过大: base64 长度 {len(image_data_url)} 超过上限 "
-                f"{config.chat_image_max_base64_size}，请压缩后重试"
-            )
 
         if not image_data_url:
             return question
 
-        # 多模态 content 块：文本块 + 图片块（qwen-vl 兼容 OpenAI image_url 格式）
+        text_block = {"type": "text", "text": question or "请识别这张图片"}
+
+        if config.chat_image_external_store:
+            # 落盘 + 引用（大小与魔数校验都在 store_data_url 内完成）
+            ref = image_store_service.store_data_url(session_id, image_data_url)
+            return [text_block, ref]
+
+        # 兼容开关关闭时的旧行为：base64 直接进消息
+        if len(image_data_url) > config.chat_image_max_base64_size:
+            raise ValueError(
+                f"图片过大: base64 长度 {len(image_data_url)} 超过上限 "
+                f"{config.chat_image_max_base64_size}，请压缩后重试"
+            )
         return [
-            {"type": "text", "text": question or "请识别这张图片"},
+            text_block,
             {"type": "image_url", "image_url": {"url": image_data_url}},
         ]
 
@@ -247,7 +274,9 @@ class RagAgentService:
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（非流式）: {question}")
 
             # system prompt 由 agent 托管（create_agent 时注入），无需重复传入
-            content = self._build_message_content(question, image_data_url)
+            content = self._build_message_content(
+                question, image_data_url, session_id=session_id
+            )
             messages = [HumanMessage(content=content)]
 
             # 构建 Agent 输入
@@ -348,7 +377,9 @@ class RagAgentService:
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（流式）: {question}")
 
             # system prompt 由 agent 托管（create_agent 时注入），无需重复传入
-            content = self._build_message_content(question, image_data_url)
+            content = self._build_message_content(
+                question, image_data_url, session_id=session_id
+            )
             messages = [HumanMessage(content=content)]
 
             # 构建 Agent 输入
@@ -417,6 +448,12 @@ class RagAgentService:
                 )
 
             yield {"type": "complete"}
+
+        except ImageValidationError:
+            # 图片校验失败属客户端输入问题，交给 API 层统一回 400。
+            # 此处安全：校验发生在任何 yield 之前（带图时会跳过语义缓存分支），
+            # 不存在「已推送部分内容又抛异常」的情况。
+            raise
 
         except Exception as e:
             detail = format_exception_chain(e)
@@ -533,6 +570,16 @@ class RagAgentService:
         """
         # 确保 checkpointer 已初始化为 AsyncSqliteSaver，MemoryService 已就绪
         await self._initialize_agent()
+
+        # 同步清理该会话的外置图片，避免消息删了、图片文件却永久残留
+        # （放在删消息之前：即使后续删除失败，图片也不会变成无主文件）
+        try:
+            await asyncio.to_thread(
+                image_store_service.cleanup_session, session_id
+            )
+        except Exception as e:
+            # 图片清理失败不应阻断会话清空这个主流程
+            logger.warning(f"[会话 {session_id}] 清理图片失败（继续清空会话）: {e}")
 
         from app.services.memory_service import get_memory_service
 

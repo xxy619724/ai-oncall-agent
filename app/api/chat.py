@@ -9,6 +9,7 @@ from sse_starlette.sse import EventSourceResponse
 from app.models.request import ChatRequest, ClearRequest, StopRequest
 from app.models.response import SessionInfoResponse, ApiResponse
 from app.agent.mcp_client import format_exception_chain
+from app.services.image_store_service import ImageValidationError
 from app.services.rag_agent_service import rag_agent_service
 from loguru import logger
 
@@ -51,6 +52,19 @@ async def chat(request: ChatRequest):
                 "success": True,
                 "answer": answer,
                 "errorMessage": None
+            }
+        }
+
+    except ImageValidationError as e:
+        # 图片超限/格式非法属于客户端输入问题，用 400 而非 500
+        logger.warning(f"[会话 {request.id}] 图片校验失败: {e}")
+        return {
+            "code": 400,
+            "message": "error",
+            "data": {
+                "success": False,
+                "answer": None,
+                "errorMessage": str(e)
             }
         }
 
@@ -170,6 +184,19 @@ async def chat_stream(request: ChatRequest):
                     }
 
             logger.info(f"[会话 {request.id}] 流式对话完成")
+
+        except ImageValidationError as e:
+            # 客户端输入问题。SSE 已开始响应、无法再改 HTTP 状态码，
+            # 因此用 code 字段告知前端这是 400 类错误而非服务端故障。
+            logger.warning(f"[会话 {request.id}] 图片校验失败: {e}")
+            yield {
+                "event": "message",
+                "data": json.dumps({
+                    "type": "error",
+                    "code": 400,
+                    "data": str(e)
+                }, ensure_ascii=False)
+            }
 
         except Exception as e:
             logger.error(f"流式对话接口错误: {format_exception_chain(e)}")
