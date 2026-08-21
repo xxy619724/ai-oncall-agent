@@ -166,10 +166,6 @@ class VectorIndexService:
             if documents:
                 vector_store_manager.add_documents(documents)
                 logger.info(f"文件索引完成: {file_path}, 共 {len(documents)} 个分片")
-
-                # P1 语义缓存：知识库已更新 → 递增版本号，缓存全量失效
-                from app.services.semantic_cache_service import semantic_cache_service
-                semantic_cache_service.bump_kb_version()
             else:
                 logger.warning(f"文件内容为空或无法分割: {file_path}")
 

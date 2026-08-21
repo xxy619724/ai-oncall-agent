@@ -23,10 +23,12 @@ def get_current_time(timezone: str = "Asia/Shanghai") -> str:
         # 获取指定时区的当前时间
         tz = ZoneInfo(timezone)
         now = datetime.now(tz)
-        
-        # 返回格式化的日期时间字符串
-        return now.strftime('%Y-%m-%d %H:%M:%S')
-        
+
+        # 返回格式化的日期时间字符串（含星期，避免模型自行推算出错）
+        weekday_map = ["一", "二", "三", "四", "五", "六", "日"]
+        weekday = weekday_map[now.weekday()]
+        return now.strftime('%Y-%m-%d %H:%M:%S') + f" 星期{weekday}"
+
     except Exception as e:
         logger.error(f"时间查询工具调用失败: {e}")
         return f"获取时间失败: {str(e)}"

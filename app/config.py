@@ -55,8 +55,10 @@ class Settings(BaseSettings):
     rag_top_k: int = 10  # 召回阶段检索数量（供重排筛选）
     rag_model: str = "qwen-max"  # 使用快速响应模型，不带扩展思考
 
-    # 聊天链路多模态配置（Qwen-VL 视觉模型，支持图片理解）
-    chat_model: str = "qwen-vl-max"  # 聊天主模型（多模态，纯文本请求也兼容）
+    # 聊天链路多模态配置（Qwen3-VL 视觉模型，支持图片理解）
+    # qwen3-vl 系列同时具备图片理解 + Function Calling 能力，
+    # 解决 qwen-vl-max 工具调用弱、qwen-max 无法看图的两难问题
+    chat_model: str = "qwen3-vl-plus"  # 聊天主模型（多模态 + 工具调用）
     chat_image_max_base64_size: int = 4 * 1024 * 1024  # 单图 base64 字符串长度上限（约 3MB 原图）
     # 图片外置存储：base64 落盘、消息里只留引用，避免 checkpoint 被图片撑大。
     # False 时退回旧行为（base64 直接进消息与 checkpoint）。
@@ -89,11 +91,6 @@ class Settings(BaseSettings):
 
     # PDF 表格提取配置（P1：pdfplumber 独立分片）
     pdf_table_extraction_enabled: bool = True  # 总开关：False 时不提取表格（等同旧行为）
-
-    # 语义缓存配置（P1：完整回答级缓存）
-    semantic_cache_enabled: bool = True        # 总开关：False 时完全旁路缓存
-    semantic_cache_threshold: float = 0.95     # 命中相似度阈值（COSINE，越高越保守）
-    semantic_cache_ttl_hours: int = 24         # 缓存 TTL（小时），过期自动失效
 
     # MCP 服务配置（transport: stdio | sse | streamable-http）
     # 腾讯云托管 MCP 的 URL 通常含 /sse/，需使用 sse；本地 FastMCP 使用 streamable-http

@@ -103,34 +103,35 @@ def generate_time_series(base_time: datetime, minutes_offset: int) -> str:
 
 @mcp.tool()
 @log_tool_call
-def get_current_timestamp() -> int:
+def get_current_timestamp(offset_minutes: int = 0) -> int:
     """获取当前时间戳（以毫秒为单位）。
-    
+
     此工具用于获取标准的毫秒时间戳，可用于：
     1. 作为 search_log 的 end_time 参数（查询到现在）
-    2. 计算历史时间点作为 start_time 参数
-    
+    2. 通过 offset_minutes 计算历史时间点作为 start_time 参数
+
+    Args:
+        offset_minutes: 时间偏移分钟数，默认为 0（即当前时刻）。
+            负数表示过去（如 -15 表示15分钟前），正数表示未来。
+
     Returns:
-        int: 当前时间戳（毫秒），例如: 1708012345000
-    
+        int: 毫秒时间戳，例如: 1708012345000
+
     使用示例:
-        # 获取当前时间
-        current = get_current_timestamp()
-        
-        # 计算15分钟前的时间
-        fifteen_min_ago = current - (15 * 60 * 1000)
-        
-        # 计算1小时前的时间
-        one_hour_ago = current - (60 * 60 * 1000)
-        
+        # 获取当前时间戳（作为 end_time）
+        end_ts = get_current_timestamp()
+
+        # 直接获取15分钟前的时间戳（作为 start_time，无需自行做减法）
+        start_ts = get_current_timestamp(offset_minutes=-15)
+
         # 用于搜索最近15分钟的日志
         search_log(
             topic_id="topic-001",
-            start_time=fifteen_min_ago,
-            end_time=current
+            start_time=start_ts,
+            end_time=end_ts
         )
     """
-    return int(datetime.now().timestamp() * 1000)
+    return int((datetime.now() + timedelta(minutes=offset_minutes)).timestamp() * 1000)
 
 
 @mcp.tool()

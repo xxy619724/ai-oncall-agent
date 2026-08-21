@@ -18,7 +18,6 @@ from langchain_qwq import ChatQwen
 
 from app.config import config
 from app.tools import DEFAULT_LOCAL_AGENT_TOOLS
-from app.services.semantic_cache_service import semantic_cache_service
 from app.services.image_store_service import (
     ImageValidationError,
     image_store_service,
@@ -45,8 +44,9 @@ class RagAgentService:
         Args:
             streaming: 是否启用流式输出，默认为 True
         """
-        # 聊天链路使用多模态模型（qwen-vl-max）：支持用户发送图片，
-        # 纯文本请求完全兼容，工具调用（function calling）同样支持
+        # 聊天链路使用多模态模型（qwen3-vl-plus）：支持用户发送图片，
+        # 纯文本请求完全兼容；qwen3-vl 系列具备较强的工具调用（function calling）能力，
+        # 解决 qwen-vl-max 工具调用弱的问题
         self.model_name = config.chat_model
         self.streaming = streaming
         self.system_prompt = self._build_system_prompt()
@@ -58,6 +58,9 @@ class RagAgentService:
             base_url=config.dashscope_api_base,
             temperature=0.7,
             streaming=streaming,
+            # qwen3-vl 是混合思考模型，聊天链路显式关闭思考模式：
+            # 降低延迟、避免 reasoning_content 干扰流式输出
+            enable_thinking=False,
             profile={"max_input_tokens": config.rag_context_window_size},
         )
 
@@ -182,7 +185,7 @@ class RagAgentService:
         return dedent("""
             你是一个专业的AI助手，能够使用多种工具来帮助用户解决问题。
 
-            工作原则:
+           工作原则:
             1. 理解用户需求，选择合适的工具来完成任务
             2. 当需要获取实时信息或专业知识时，主动使用相关工具
             3. 基于工具返回的结果提供准确、专业的回答
@@ -259,16 +262,6 @@ class RagAgentService:
             str: 完整答案
         """
         try:
-            # P1 语义缓存：命中直接返回完整回答（跳过检索 + 生成）
-            # 图片问题不缓存（视觉识别结果时效性差、复用价值低）
-            if config.semantic_cache_enabled and not image_data_url:
-                cached = await asyncio.to_thread(
-                    semantic_cache_service.lookup, question
-                )
-                if cached is not None:
-                    logger.info(f"[会话 {session_id}] 语义缓存命中，直接返回")
-                    return cached
-
             await self._initialize_agent()
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（非流式）: {question}")
@@ -319,12 +312,6 @@ class RagAgentService:
                         session_id, message_count=len(messages_result)
                     )
 
-                # P1 语义缓存：写入完整回答（失败内部静默降级，不影响返回）
-                if config.semantic_cache_enabled and not image_data_url and answer:
-                    await asyncio.to_thread(
-                        semantic_cache_service.store, question, str(answer)
-                    )
-
                 return answer
 
             logger.warning(f"[会话 {session_id}] Agent 返回结果为空")
@@ -361,17 +348,6 @@ class RagAgentService:
         self._stop_flags[session_id] = stop_event
 
         try:
-            # P1 语义缓存：命中直接返回完整回答（一次性推送给前端）
-            if config.semantic_cache_enabled and not image_data_url:
-                cached = await asyncio.to_thread(
-                    semantic_cache_service.lookup, question
-                )
-                if cached is not None:
-                    logger.info(f"[会话 {session_id}] 语义缓存命中（流式）")
-                    yield {"type": "content", "data": cached}
-                    yield {"type": "complete"}
-                    return
-
             await self._initialize_agent()
 
             logger.info(f"[会话 {session_id}] RAG Agent 收到查询（流式）: {question}")
@@ -393,7 +369,7 @@ class RagAgentService:
             }
 
             stopped = False
-            full_answer = ""  # 累计完整回答（语义缓存写入用）
+            full_answer = ""  # 累计完整回答
             async for token, metadata in self.agent.astream(
                 input=agent_input,
                 config=config_dict,
@@ -423,7 +399,7 @@ class RagAgentService:
                                     }
 
             if stopped:
-                # 用户主动终止：跳过摘要同步与缓存写入（本轮回答未完成，不入 checkpoint），
+                # 用户主动终止：跳过摘要同步（本轮回答未完成，不入 checkpoint），
                 # 已生成的部分内容已通过 content 事件推给前端
                 logger.info(f"[会话 {session_id}] 收到停止请求，流式输出已终止")
                 yield {"type": "stopped"}
@@ -441,18 +417,11 @@ class RagAgentService:
             if self._cleaner:
                 await self._cleaner.touch_session(session_id)
 
-            # P1 语义缓存：写入完整回答（失败内部静默降级）
-            if config.semantic_cache_enabled and not image_data_url and full_answer:
-                await asyncio.to_thread(
-                    semantic_cache_service.store, question, full_answer
-                )
-
             yield {"type": "complete"}
 
         except ImageValidationError:
             # 图片校验失败属客户端输入问题，交给 API 层统一回 400。
-            # 此处安全：校验发生在任何 yield 之前（带图时会跳过语义缓存分支），
-            # 不存在「已推送部分内容又抛异常」的情况。
+            # 校验发生在任何 yield 之前，不存在「已推送部分内容又抛异常」的情况。
             raise
 
         except Exception as e:
